@@ -1,4 +1,4 @@
-# PowerTrader_AI
+# PowerTrader_AI - KUCOIN (EU)
 Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
 
 ## About this KuCoin fork
