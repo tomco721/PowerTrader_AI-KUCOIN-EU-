@@ -6,13 +6,12 @@ import time
 import math
 from typing import Any, Dict, Optional
 import requests
-from nacl.signing import SigningKey
 import os
 import colorama
 from colorama import Fore, Style
 import traceback
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from cryptography.hazmat.primitives import serialization
+import hmac
+import hashlib
 
 # -----------------------------
 # GUI HUB OUTPUTS
@@ -322,23 +321,26 @@ def _refresh_paths_and_symbols():
 
 #API STUFF
 API_KEY = ""
-BASE64_PRIVATE_KEY = ""
+API_SECRET = ""
+API_PASSPHRASE = ""
 
 try:
-    with open('r_key.txt', 'r', encoding='utf-8') as f:
+    with open('k_key.txt', 'r', encoding='utf-8') as f:
         API_KEY = (f.read() or "").strip()
-    with open('r_secret.txt', 'r', encoding='utf-8') as f:
-        BASE64_PRIVATE_KEY = (f.read() or "").strip()
+    with open('k_secret.txt', 'r', encoding='utf-8') as f:
+        API_SECRET = (f.read() or "").strip()
+    with open('k_pass.txt', 'r', encoding='utf-8') as f:
+        API_PASSPHRASE = (f.read() or "").strip()
 except Exception:
     API_KEY = ""
-    BASE64_PRIVATE_KEY = ""
+    API_SECRET = ""
+    API_PASSPHRASE = ""
 
-if not API_KEY or not BASE64_PRIVATE_KEY:
+if not API_KEY or not API_SECRET or not API_PASSPHRASE:
     print(
-        "\n[PowerTrader] Robinhood API credentials not found.\n"
-        "Open the GUI and go to Settings → Robinhood API → Setup / Update.\n"
-        "That wizard will generate your keypair, tell you where to paste the public key on Robinhood,\n"
-        "and will save r_key.txt + r_secret.txt so this trader can authenticate.\n"
+        "\n[PowerTrader] KuCoin API credentials not found.\n"
+        "Open the GUI and go to Settings → KuCoin API → Setup / Update.\n"
+        "That wizard will save k_key.txt, k_secret.txt, and k_pass.txt so this trader can authenticate.\n"
     )
     raise SystemExit(1)
 
@@ -348,9 +350,9 @@ class CryptoAPITrading:
         self.path_map = dict(base_paths)
 
         self.api_key = API_KEY
-        private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
-        self.private_key = SigningKey(private_key_seed)
-        self.base_url = "https://trading.robinhood.com"
+        self.api_secret = API_SECRET
+        self.api_passphrase = API_PASSPHRASE
+        self.base_url = "https://api.kucoin.com"
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = list(DCA_LEVELS)  # Hard DCA triggers (percent PnL)
@@ -418,10 +420,13 @@ class CryptoAPITrading:
 
     def _append_jsonl(self, path: str, obj: dict) -> None:
         try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(obj) + "\n")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[TRADER] Error writing to {path}: {e}")
+            print(traceback.format_exc())
 
     def _load_pnl_ledger(self) -> dict:
         try:
@@ -484,14 +489,25 @@ class CryptoAPITrading:
 
     def _get_order_by_id(self, symbol: str, order_id: str) -> Optional[dict]:
         try:
-            orders = self.get_orders(symbol)
-            results = orders.get("results", []) if isinstance(orders, dict) else []
-            for o in results:
-                try:
-                    if o.get("id") == order_id:
-                        return o
-                except Exception:
-                    continue
+            # KuCoin: Get order by ID directly
+            kucoin_symbol = symbol.replace("-USD", "-USDT")
+            path = f"/api/v1/orders/{order_id}"
+            order = self.make_api_request("GET", path)
+            
+            if order and isinstance(order, dict):
+                # Convert to format similar to Robinhood
+                return {
+                    "id": order.get("id", ""),
+                    "symbol": symbol,  # Keep original symbol format
+                    "side": order.get("side", "").lower(),
+                    "type": order.get("type", "").lower(),
+                    "state": order.get("status", "").lower(),
+                    "quantity": str(order.get("size", 0.0) or 0.0),
+                    "filled_quantity": str(order.get("filledSize", 0.0) or 0.0),
+                    "price": str(order.get("price", 0.0) or 0.0),
+                    "created_at": order.get("createdAt", 0),
+                    "executions": [],  # KuCoin doesn't provide executions in order response
+                }
         except Exception:
             pass
         return None
@@ -499,35 +515,46 @@ class CryptoAPITrading:
     def _extract_fill_from_order(self, order: dict) -> tuple:
         """Returns (filled_qty, avg_fill_price). avg_fill_price may be None."""
         try:
-            execs = order.get("executions", []) or []
-            total_qty = 0.0
-            total_notional = 0.0
-            for ex in execs:
-                try:
-                    q = float(ex.get("quantity", 0.0) or 0.0)
-                    p = float(ex.get("effective_price", 0.0) or 0.0)
-                    if q > 0.0 and p > 0.0:
-                        total_qty += q
-                        total_notional += (q * p)
-                except Exception:
-                    continue
-
-            avg_price = (total_notional / total_qty) if (total_qty > 0.0 and total_notional > 0.0) else None
-
-            # Fallbacks if executions are not populated yet
-            if total_qty <= 0.0:
-                for k in ("filled_asset_quantity", "filled_quantity", "asset_quantity", "quantity"):
-                    if k in order:
-                        try:
-                            v = float(order.get(k) or 0.0)
-                            if v > 0.0:
-                                total_qty = v
-                                break
-                        except Exception:
-                            continue
-
+            # KuCoin order format: filledSize, dealSize, dealFunds
+            filled_qty = 0.0
+            avg_price = None
+            
+            # Try to get filled quantity
+            for k in ("filled_quantity", "filledSize", "dealSize", "filled_asset_quantity"):
+                if k in order:
+                    try:
+                        v = float(order.get(k) or 0.0)
+                        if v > 0.0:
+                            filled_qty = v
+                            break
+                    except Exception:
+                        continue
+            
+            # Try to calculate average price from dealFunds / dealSize
+            deal_funds = None
+            deal_size = None
+            for k in ("dealFunds", "deal_funds", "filled_funds"):
+                if k in order:
+                    try:
+                        deal_funds = float(order.get(k) or 0.0)
+                        break
+                    except Exception:
+                        continue
+            
+            for k in ("dealSize", "deal_size", "filledSize", "filled_quantity"):
+                if k in order:
+                    try:
+                        deal_size = float(order.get(k) or 0.0)
+                        break
+                    except Exception:
+                        continue
+            
+            if deal_funds and deal_size and deal_size > 0:
+                avg_price = deal_funds / deal_size
+            
+            # Fallback to price field if available
             if avg_price is None:
-                for k in ("average_price", "avg_price", "price", "effective_price"):
+                for k in ("average_price", "avg_price", "price", "effective_price", "dealPrice"):
                     if k in order:
                         try:
                             v = float(order.get(k) or 0.0)
@@ -537,22 +564,92 @@ class CryptoAPITrading:
                         except Exception:
                             continue
 
-            return float(total_qty), (float(avg_price) if avg_price is not None else None)
+            return float(filled_qty), (float(avg_price) if avg_price is not None else None)
         except Exception:
             return 0.0, None
 
     def _wait_for_order_terminal(self, symbol: str, order_id: str) -> Optional[dict]:
         """Blocks until order is filled/canceled/rejected, then returns the order dict."""
-        terminal = {"filled", "canceled", "cancelled", "rejected", "failed", "error"}
-        while True:
+        # KuCoin order statuses: "new", "match", "open", "done", "pending", "active", "filled"
+        terminal = {"done", "filled", "canceled", "cancelled", "rejected", "failed", "error"}
+        max_retries = 60  # Max 60 seconds of polling (60 retries * 1 second sleep)
+        retry_count = 0
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 5  # After 5 consecutive timeouts, try fallback method
+        
+        while retry_count < max_retries:
             o = self._get_order_by_id(symbol, order_id)
             if not o:
+                consecutive_timeouts += 1
+                retry_count += 1
+                
+                # If we've had too many consecutive timeouts, try fallback method
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    print(f"[TRADER] Direct order lookup timing out for {order_id}, trying fallback method...")
+                    # Fallback: try to find the order in recent orders list
+                    try:
+                        orders_response = self.get_orders(symbol)
+                        if orders_response and "results" in orders_response:
+                            all_orders = orders_response["results"]
+                            # Find our order by ID
+                            for order in all_orders:
+                                if str(order.get("id", "")) == str(order_id):
+                                    st = str(order.get("state", "")).lower().strip()
+                                    # Also check raw KuCoin fields if state is empty
+                                    if not st:
+                                        is_active = order.get("_raw_isActive", True)
+                                        deal_size = float(order.get("_raw_dealSize") or order.get("deal_size") or 0.0)
+                                        if not is_active and deal_size > 0:
+                                            st = "filled"
+                                            print(f"[TRADER] Inferred filled state from isActive=False and dealSize={deal_size}")
+                                    # If it's in terminal state, return it
+                                    if st in terminal or st == "done":
+                                        print(f"[TRADER] Found order {order_id} via fallback method, state: {st}")
+                                        return order
+                                    # If found but not terminal, continue waiting
+                                    print(f"[TRADER] Found order {order_id} via fallback method, but state is not terminal: {st}")
+                                    break
+                    except Exception as e:
+                        print(f"[TRADER] Fallback method failed: {e}")
+                    
+                    consecutive_timeouts = 0  # Reset counter after trying fallback
+                
                 time.sleep(1)
                 continue
+            
+            # Successfully got order - reset timeout counter
+            consecutive_timeouts = 0
             st = str(o.get("state", "")).lower().strip()
-            if st in terminal:
+            # KuCoin uses "done" for completed orders (filled or canceled)
+            if st in terminal or st == "done":
                 return o
+            retry_count += 1
             time.sleep(1)
+        
+        # Final fallback attempt before giving up
+        print(f"[TRADER] Warning: Order {order_id} for {symbol} did not reach terminal state within {max_retries} seconds, trying final fallback...")
+        try:
+            orders_response = self.get_orders(symbol)
+            if orders_response and "results" in orders_response:
+                all_orders = orders_response["results"]
+                for order in all_orders:
+                    if str(order.get("id", "")) == str(order_id):
+                        st = str(order.get("state", "")).lower().strip()
+                        # Also check raw KuCoin fields if state is empty
+                        if not st:
+                            is_active = order.get("_raw_isActive", True)
+                            deal_size = float(order.get("_raw_dealSize") or order.get("deal_size") or 0.0)
+                            if not is_active and deal_size > 0:
+                                st = "filled"
+                                print(f"[TRADER] Inferred filled state from isActive=False and dealSize={deal_size}")
+                        if st in terminal or st == "done":
+                            print(f"[TRADER] Found order {order_id} via final fallback, state: {st}")
+                            return order
+                        print(f"[TRADER] Found order {order_id} via final fallback, but state is not terminal: {st}")
+        except Exception as e:
+            print(f"[TRADER] Final fallback method failed: {e}")
+        
+        return None
 
     def _reconcile_pending_orders(self) -> None:
         """
@@ -725,13 +822,24 @@ class CryptoAPITrading:
                             frac = 1.0
 
                         cost_used = float(pos_usd_cost) * float(frac)
-                        pos["usd_cost"] = float(pos_usd_cost) - float(cost_used)
-                        pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
-
                         position_cost_used = float(cost_used)
-                        position_cost_after = float(pos.get("usd_cost", 0.0) or 0.0)
 
-                        realized = float(usd_got) - float(cost_used)
+                        # Prefer true cost basis from KuCoin when available, so realized USD matches pnl@trade %
+                        acb = float(avg_cost_basis) if avg_cost_basis is not None else None
+                        fee_val = float(fees_usd) if fees_usd is not None else 0.0
+                        if acb is not None and acb > 0 and price is not None and q > 0:
+                            cost_used_acb = acb * q
+                            realized = (float(price) - acb) * q - fee_val
+                            # Update ledger using true cost so it doesn't propagate old errors
+                            pos["usd_cost"] = float(pos_usd_cost) - float(cost_used_acb)
+                            pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
+                            position_cost_used = float(cost_used_acb)
+                        else:
+                            realized = float(usd_got) - float(cost_used)
+                            pos["usd_cost"] = float(pos_usd_cost) - float(cost_used)
+                            pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
+
+                        position_cost_after = float(pos.get("usd_cost", 0.0) or 0.0)
                         self._pnl_ledger["total_realized_profit_usd"] = float(self._pnl_ledger.get("total_realized_profit_usd", 0.0) or 0.0) + float(realized)
 
                         # Clean up tiny dust
@@ -781,7 +889,8 @@ class CryptoAPITrading:
 
     @staticmethod
     def _get_current_timestamp() -> int:
-        return int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp())
+        # KuCoin requires timestamp in milliseconds
+        return int(datetime.datetime.now(tz=datetime.timezone.utc).timestamp() * 1000)
 
     @staticmethod
     def _fmt_price(price: float) -> str:
@@ -933,9 +1042,10 @@ class CryptoAPITrading:
                 continue
 
             # Filter for filled buy and sell orders
+            # KuCoin uses "done" status for completed orders
             filled_orders = [
                 order for order in orders["results"]
-                if order["state"] == "filled" and order["side"] in ["buy", "sell"]
+                if (order["state"] == "filled" or order["state"] == "done") and order["side"] in ["buy", "sell"]
             ]
             
             if not filled_orders:
@@ -1095,69 +1205,270 @@ class CryptoAPITrading:
 
 
     def make_api_request(self, method: str, path: str, body: Optional[str] = "") -> Any:
-
         timestamp = self._get_current_timestamp()
-        headers = self.get_authorization_header(method, path, body, timestamp)
+        headers = self.get_authorization_header(method, path, body or "", timestamp)
         url = self.base_url + path
 
         try:
+            # Use longer timeout for order status checks (they can be slower)
+            timeout_seconds = 20 if "/api/v1/orders/" in path else 10
             if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
+                response = requests.get(url, headers=headers, timeout=timeout_seconds)
             elif method == "POST":
-                response = requests.post(url, headers=headers, json=json.loads(body), timeout=10)
+                # For POST, body should be JSON string
+                if body:
+                    response = requests.post(url, headers=headers, data=body, timeout=timeout_seconds)
+                else:
+                    response = requests.post(url, headers=headers, timeout=timeout_seconds)
+            elif method == "DELETE":
+                response = requests.delete(url, headers=headers, timeout=timeout_seconds)
 
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            # KuCoin wraps responses in a "data" field
+            if isinstance(result, dict) and "data" in result:
+                return result["data"]
+            return result
         except requests.HTTPError as http_err:
             try:
                 # Parse and return the JSON error response
                 error_response = response.json()
+                print(f"[TRADER] API Error ({method} {path}): {error_response}")
                 return error_response  # Return the JSON error for further handling
-            except Exception:
+            except Exception as e:
+                print(f"[TRADER] API HTTP Error ({method} {path}): {http_err} - Could not parse response: {e}")
                 return None
-        except Exception:
+        except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout) as timeout_err:
+            # Timeouts are common transient network issues - don't spam full traceback
+            # Just log a brief message and return None so caller can retry
+            print(f"[TRADER] API Timeout ({method} {path}): {timeout_err}")
+            return None
+        except Exception as e:
+            print(f"[TRADER] API Exception ({method} {path}): {e}")
+            print(traceback.format_exc())
             return None
 
     def get_authorization_header(
             self, method: str, path: str, body: str, timestamp: int
     ) -> Dict[str, str]:
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
+        # KuCoin authentication: HMAC-SHA256 signature
+        # Signature = base64(hmac_sha256(secret, timestamp + method + endpoint + body))
+        body_str = body if body else ""
+        message = str(timestamp) + method.upper() + path + body_str
+        signature = base64.b64encode(
+            hmac.new(
+                self.api_secret.encode('utf-8'),
+                message.encode('utf-8'),
+                hashlib.sha256
+            ).digest()
+        ).decode('utf-8')
+        
+        # Encrypt passphrase
+        passphrase_signature = base64.b64encode(
+            hmac.new(
+                self.api_secret.encode('utf-8'),
+                self.api_passphrase.encode('utf-8'),
+                hashlib.sha256
+            ).digest()
+        ).decode('utf-8')
 
         return {
-            "x-api-key": self.api_key,
-            "x-signature": base64.b64encode(signed.signature).decode("utf-8"),
-            "x-timestamp": str(timestamp),
+            "KC-API-KEY": self.api_key,
+            "KC-API-SIGN": signature,
+            "KC-API-TIMESTAMP": str(timestamp),
+            "KC-API-PASSPHRASE": passphrase_signature,
+            "KC-API-KEY-VERSION": "2",
+            "Content-Type": "application/json",
         }
 
     def get_account(self) -> Any:
-        path = "/api/v1/crypto/trading/accounts/"
-        return self.make_api_request("GET", path)
+        # KuCoin: Get account list (returns list of accounts with different types)
+        path = "/api/v1/accounts"
+        accounts = self.make_api_request("GET", path)
+        if not accounts:
+            return {}
+
+        # Find the main trading account for USDT (type: 'trade', currency: 'USDT')
+        trading_account = None
+        if isinstance(accounts, list):
+            # Prefer explicit USDT trade account
+            for acc in accounts:
+                if (
+                    isinstance(acc, dict)
+                    and acc.get("type") == "trade"
+                    and str(acc.get("currency", "")).upper() == "USDT"
+                ):
+                    trading_account = acc
+                    break
+
+            # Fallback: any trade account (should normally still be USDT, but be defensive)
+            if trading_account is None:
+                for acc in accounts:
+                    if isinstance(acc, dict) and acc.get("type") == "trade":
+                        trading_account = acc
+                        break
+
+        # Final fallback: first account or empty dict
+        if trading_account is None:
+            trading_account = accounts[0] if isinstance(accounts, list) and accounts else {}
+
+        # Convert to format similar to Robinhood (buying_power = available USDT balance)
+        buying_power = float(trading_account.get("available", 0.0) or 0.0)
+        return {
+            "buying_power": buying_power,
+            "currency": trading_account.get("currency", "USDT"),
+        }
 
     def get_holdings(self) -> Any:
-        path = "/api/v1/crypto/trading/holdings/"
-        return self.make_api_request("GET", path)
+        # KuCoin: Get all accounts and filter for non-zero balances
+        path = "/api/v1/accounts"
+        accounts = self.make_api_request("GET", path)
+        if not accounts:
+            return {"results": []}
+        
+        # Filter for accounts with balance > 0 and type = 'trade'
+        holdings = []
+        for acc in accounts:
+            if isinstance(acc, dict):
+                balance = float(acc.get("balance", 0.0) or 0.0)
+                if balance > 0 and acc.get("type") == "trade":
+                    # Convert to format similar to Robinhood
+                    currency = acc.get("currency", "")
+                    if currency and currency != "USDT":  # Skip USDT as it's the quote currency
+                        holdings.append({
+                            "asset_code": currency,
+                            "total_quantity": str(balance),
+                            "available": str(acc.get("available", 0.0) or 0.0),
+                        })
+        
+        return {"results": holdings}
 
     def get_trading_pairs(self) -> Any:
-        path = "/api/v1/crypto/trading/trading_pairs/"
-        response = self.make_api_request("GET", path)
-
-        if not response or "results" not in response:
+        # KuCoin: Get trading symbols
+        path = "/api/v1/symbols"
+        symbols = self.make_api_request("GET", path)
+        if not symbols:
             return []
-
-        trading_pairs = response.get("results", [])
-        if not trading_pairs:
-            return []
-
+        
+        # Convert to format similar to Robinhood
+        trading_pairs = []
+        for sym in symbols:
+            if isinstance(sym, dict) and sym.get("enableTrading"):
+                trading_pairs.append({
+                    "symbol": sym.get("symbol", ""),
+                    "base_currency": sym.get("baseCurrency", ""),
+                    "quote_currency": sym.get("quoteCurrency", ""),
+                })
+        
         return trading_pairs
 
+    def get_symbol_info(self, symbol: str) -> Optional[dict]:
+        """Get symbol information including minFunds, baseMinSize, etc."""
+        # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
+        kucoin_symbol = symbol.replace("-USD", "-USDT")
+        # Try v2 endpoint first (more detailed)
+        path = f"/api/v2/symbols/{kucoin_symbol}"
+        symbol_info = self.make_api_request("GET", path)
+        if not symbol_info:
+            # Fallback to v1 endpoint
+            path = f"/api/v1/symbols/{kucoin_symbol}"
+            symbol_info = self.make_api_request("GET", path)
+        return symbol_info
+
     def get_orders(self, symbol: str) -> Any:
-        path = f"/api/v1/crypto/trading/orders/?symbol={symbol}"
-        return self.make_api_request("GET", path)
+        # KuCoin: Get orders for a symbol
+        # Convert symbol format from "BTC-USD" to "BTC-USDT"
+        kucoin_symbol = symbol.replace("-USD", "-USDT")
+        path = f"/api/v1/orders?symbol={kucoin_symbol}&status=active"
+        orders = self.make_api_request("GET", path)
+        
+        # Get ALL filled orders with pagination (required for correct cost basis: all BUY + DCA levels)
+        page_size = 100
+        current_page = 1
+        all_filled_raw = []
+        while True:
+            path_filled = f"/api/v1/orders?symbol={kucoin_symbol}&status=done&currentPage={current_page}&pageSize={page_size}"
+            filled_page = self.make_api_request("GET", path_filled)
+            if not filled_page:
+                break
+            items = []
+            if isinstance(filled_page, list):
+                items = filled_page
+            elif isinstance(filled_page, dict) and "items" in filled_page:
+                items = filled_page.get("items") or []
+            all_filled_raw.extend(items)
+            total_page = filled_page.get("totalPage") if isinstance(filled_page, dict) else None
+            if total_page is not None and current_page >= total_page:
+                break
+            if len(items) < page_size:
+                break
+            current_page += 1
+        filled_orders = {"items": all_filled_raw} if all_filled_raw else None
+        
+        all_orders = []
+        if orders:
+            if isinstance(orders, list):
+                all_orders.extend(orders)
+            elif isinstance(orders, dict) and "items" in orders:
+                all_orders.extend(orders["items"])
+        
+        if filled_orders and filled_orders.get("items"):
+            all_orders.extend(filled_orders["items"])
+        
+        # Convert to format similar to Robinhood
+        converted_orders = []
+        for order in all_orders:
+            if isinstance(order, dict):
+                # Debug: log raw order to see what KuCoin actually returns
+                if len(converted_orders) == 0:  # Only log first order to avoid spam
+                    print(f"[TRADER] Raw KuCoin order keys: {list(order.keys())}")
+                    print(f"[TRADER] Raw KuCoin order sample: {order}")
+                
+                # Map KuCoin order fields to Robinhood-like format
+                # KuCoin uses different field names - try multiple possibilities
+                state = order.get("status") or order.get("state") or ""
+                if isinstance(state, str):
+                    state = state.lower()
+                
+                # If state is empty, infer from KuCoin-specific fields
+                if not state:
+                    is_active = order.get("isActive", True)
+                    deal_size = float(order.get("dealSize") or order.get("deal_size") or 0.0)
+                    # If order is not active and has dealSize > 0, it's filled
+                    if not is_active and deal_size > 0:
+                        state = "filled"
+                    elif not is_active:
+                        state = "done"  # Done but might be canceled
+                
+                # Include dealFunds and dealSize for market order price calculation
+                converted_orders.append({
+                    "id": order.get("id", ""),
+                    "symbol": symbol,  # Keep original symbol format
+                    "side": (order.get("side") or "").lower(),
+                    "type": (order.get("type") or "").lower(),
+                    "state": state,
+                    "quantity": str(order.get("size") or order.get("quantity") or 0.0),
+                    "filled_quantity": str(order.get("filledSize") or order.get("filled_quantity") or order.get("dealSize") or 0.0),
+                    "price": str(order.get("price") or 0.0),
+                    "created_at": order.get("createdAt") or order.get("created_at") or 0,
+                    "deal_funds": str(order.get("dealFunds") or order.get("deal_funds") or 0.0),  # Total cost for filled orders
+                    "deal_size": str(order.get("dealSize") or order.get("deal_size") or 0.0),  # Filled quantity
+                    "executions": [],  # Will be populated separately if needed
+                    # Store raw fields for fallback checks
+                    "_raw_isActive": order.get("isActive"),
+                    "_raw_dealSize": order.get("dealSize"),
+                })
+        
+        return {"results": converted_orders}
 
     def calculate_cost_basis(self):
+        """Compute weighted-average cost per coin over ALL filled BUY orders (initial + all DCA levels).
+        get_orders() now paginates so we have full history; SELL/PM/trailing use this full cost
+        so we only sell when there is real profit vs entire position cost."""
+        print("[TRADER] calculate_cost_basis() called")
         holdings = self.get_holdings()
         if not holdings or "results" not in holdings:
+            print("[TRADER] No holdings found in calculate_cost_basis")
             return {}
 
         active_assets = {holding["asset_code"] for holding in holdings.get("results", [])}
@@ -1165,49 +1476,256 @@ class CryptoAPITrading:
             holding["asset_code"]: float(holding["total_quantity"])
             for holding in holdings.get("results", [])
         }
+        
+        print(f"[TRADER] Active assets: {active_assets}")
+        print(f"[TRADER] Current quantities: {current_quantities}")
 
         cost_basis = {}
 
         for asset_code in active_assets:
             orders = self.get_orders(f"{asset_code}-USD")
             if not orders or "results" not in orders:
+                print(f"[TRADER] No orders found for {asset_code}, trying trade history...")
+                # Fallback to trade history if orders aren't available
+                cost_basis_from_history = self._calculate_cost_basis_from_history(asset_code, current_quantities.get(asset_code, 0.0))
+                if cost_basis_from_history > 0:
+                    cost_basis[asset_code] = cost_basis_from_history
                 continue
 
             # Get all filled buy orders, sorted from most recent to oldest
+            # KuCoin uses "done" status for completed orders
+            all_orders_list = orders.get("results", [])
+            print(f"[TRADER] Found {len(all_orders_list)} total orders for {asset_code}")
+            
+            # Debug: show all orders to see their actual state
+            for idx, order in enumerate(all_orders_list):
+                print(f"[TRADER]   Order {idx+1}: side={order.get('side', 'N/A')}, state={order.get('state', 'N/A')}, type={order.get('type', 'N/A')}, filled_qty={order.get('filled_quantity', 'N/A')}, price={order.get('price', 'N/A')}")
+            
+            # Match buy orders that are filled (state="filled"/"done" OR have filled_quantity > 0)
             buy_orders = [
-                order for order in orders["results"]
-                if order["side"] == "buy" and order["state"] == "filled"
+                order for order in all_orders_list
+                if order.get("side") == "buy" and (
+                    order.get("state") == "filled" or 
+                    order.get("state") == "done" or
+                    float(order.get("filled_quantity") or order.get("quantity") or "0") > 0
+                )
             ]
+            
+            print(f"[TRADER] Found {len(buy_orders)} filled buy orders for {asset_code}")
+            if buy_orders:
+                for idx, bo in enumerate(buy_orders):
+                    print(f"[TRADER]   Order {idx+1}: id={bo.get('id', 'N/A')}, side={bo.get('side', 'N/A')}, state={bo.get('state', 'N/A')}, filled_qty={bo.get('filled_quantity', 'N/A')}, price={bo.get('price', 'N/A')}, deal_funds={bo.get('deal_funds', 'N/A')}, deal_size={bo.get('deal_size', 'N/A')}")
+            
+            if not buy_orders:
+                print(f"[TRADER] No filled buy orders found for {asset_code}, trying trade history...")
+                # Fallback to trade history
+                cost_basis_from_history = self._calculate_cost_basis_from_history(asset_code, current_quantities.get(asset_code, 0.0))
+                if cost_basis_from_history > 0:
+                    cost_basis[asset_code] = cost_basis_from_history
+                    print(f"[TRADER] Using cost basis from history for {asset_code}: ${cost_basis_from_history:.8f}")
+                else:
+                    print(f"[TRADER] Could not calculate cost basis from history for {asset_code} either")
+                continue
+            
             buy_orders.sort(key=lambda x: x["created_at"], reverse=True)
 
             remaining_quantity = current_quantities[asset_code]
             total_cost = 0.0
+            print(f"[TRADER] Calculating cost basis for {asset_code}: {len(buy_orders)} buy orders, current qty: {remaining_quantity}")
 
             for order in buy_orders:
-                for execution in order.get("executions", []):
-                    quantity = float(execution["quantity"])
-                    price = float(execution["effective_price"])
+                # For market orders, we need to get the actual fill price from dealFunds/dealSize
+                filled_qty_str = order.get("filled_quantity") or order.get("quantity") or "0"
+                try:
+                    quantity = float(filled_qty_str)
+                except Exception:
+                    continue
+                
+                if quantity <= 0:
+                    continue
 
-                    if remaining_quantity <= 0:
-                        break
+                # Try to get price from order - for market orders, this might be 0
+                price_str = order.get("price") or "0"
+                price = 0.0
+                try:
+                    price = float(price_str)
+                except Exception:
+                    pass
+                
+                # For market orders, calculate average price from dealFunds/dealSize if available
+                # KuCoin provides dealFunds (total cost) and dealSize (filled quantity) for filled orders
+                if price <= 0:
+                    deal_funds_str = order.get("deal_funds") or "0"
+                    deal_size_str = order.get("deal_size") or "0"
+                    try:
+                        deal_funds = float(deal_funds_str)
+                        deal_size = float(deal_size_str)
+                        if deal_funds > 0 and deal_size > 0:
+                            price = deal_funds / deal_size
+                    except Exception:
+                        pass
+                
+                # If still no price, try fetching full order details
+                if price <= 0:
+                    order_id = order.get("id")
+                    if order_id:
+                        full_order = self._get_order_by_id(f"{asset_code}-USD", order_id)
+                        if full_order:
+                            # Extract from full order
+                            for k in ("dealFunds", "deal_funds", "filled_funds"):
+                                if k in full_order:
+                                    try:
+                                        deal_funds = float(full_order.get(k) or 0.0)
+                                        deal_size = float(quantity)  # Use quantity we already have
+                                        if deal_funds > 0 and deal_size > 0:
+                                            price = deal_funds / deal_size
+                                            break
+                                    except Exception:
+                                        continue
+                
+                # If still no price, skip this order (can't calculate cost basis without price)
+                if price <= 0:
+                    print(f"[TRADER] Warning: Could not determine price for {asset_code} order {order.get('id', 'unknown')}, skipping cost basis calculation for this order")
+                    continue
 
-                    # Use only the portion of the quantity needed to match the current holdings
-                    if quantity > remaining_quantity:
-                        total_cost += remaining_quantity * price
-                        remaining_quantity = 0
-                    else:
-                        total_cost += quantity * price
-                        remaining_quantity -= quantity
+                if remaining_quantity <= 0:
+                    break
+
+                # Use only the portion of the quantity needed to match the current holdings
+                if quantity > remaining_quantity:
+                    total_cost += remaining_quantity * price
+                    remaining_quantity = 0
+                else:
+                    total_cost += quantity * price
+                    remaining_quantity -= quantity
 
                 if remaining_quantity <= 0:
                     break
 
             if current_quantities[asset_code] > 0:
                 cost_basis[asset_code] = total_cost / current_quantities[asset_code]
+                print(f"[TRADER] Calculated cost basis for {asset_code}: ${cost_basis[asset_code]:.8f} (total_cost: ${total_cost:.8f}, qty: {current_quantities[asset_code]:.8f})")
             else:
                 cost_basis[asset_code] = 0.0
+                print(f"[TRADER] No quantity for {asset_code}, cost basis = 0")
 
         return cost_basis
+
+    def _calculate_cost_basis_from_history(self, asset_code: str, current_quantity: float) -> float:
+        """Calculate cost basis from trade history file (all BUY lines). Uses newest-first like API."""
+        if current_quantity <= 0:
+            return 0.0
+        
+        if not os.path.isfile(TRADE_HISTORY_PATH):
+            return 0.0
+        
+        try:
+            buy_trades = []
+            total_lines = 0
+            matching_lines = 0
+            with open(TRADE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    total_lines += 1
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    
+                    sym = str(obj.get("symbol", "")).upper().strip()
+                    base = sym.split("-")[0].strip() if sym else ""
+                    if base != asset_code.upper().strip():
+                        continue
+                    
+                    matching_lines += 1
+                    side = str(obj.get("side", "")).lower().strip()
+                    if side != "buy":
+                        continue
+                    
+                    qty = obj.get("qty", 0.0)
+                    price = obj.get("price", None)
+                    
+                    try:
+                        qty_f = float(qty)
+                        price_f = float(price) if price is not None else 0.0
+                        if qty_f > 0 and price_f > 0:
+                            buy_trades.append({"qty": qty_f, "price": price_f, "ts": obj.get("ts", 0)})
+                            print(f"[TRADER] Found buy trade in history: {asset_code} qty={qty_f} price={price_f}")
+                    except Exception as e:
+                        print(f"[TRADER] Error parsing trade: {e}")
+                        continue
+            
+            print(f"[TRADER] Trade history: {total_lines} total lines, {matching_lines} matching {asset_code}, {len(buy_trades)} buy trades")
+            
+            if not buy_trades:
+                print(f"[TRADER] No buy trades found in history for {asset_code}")
+                return 0.0
+            
+            # Sort by timestamp newest first (same as API LIFO) so cost basis matches API logic
+            buy_trades.sort(key=lambda x: x["ts"], reverse=True)
+            total_cost = 0.0
+            remaining_qty = current_quantity
+            
+            for trade in buy_trades:
+                if remaining_qty <= 0:
+                    break
+                qty = trade["qty"]
+                price = trade["price"]
+                
+                if qty > remaining_qty:
+                    total_cost += remaining_qty * price
+                    remaining_qty = 0
+                else:
+                    total_cost += qty * price
+                    remaining_qty -= qty
+                
+                if remaining_qty <= 0:
+                    break
+            
+            if current_quantity > 0:
+                avg_cost = total_cost / current_quantity
+                return avg_cost
+        except Exception:
+            pass
+        
+        return 0.0
+
+    def _get_price_from_trade_history(self, asset_code: str, order_id: str) -> Optional[float]:
+        """Get fill price from trade history for a specific order ID."""
+        if not os.path.isfile(TRADE_HISTORY_PATH):
+            return None
+        
+        try:
+            with open(TRADE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = (line or "").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    
+                    if str(obj.get("order_id", "")) != str(order_id):
+                        continue
+                    
+                    sym = str(obj.get("symbol", "")).upper().strip()
+                    base = sym.split("-")[0].strip() if sym else ""
+                    if base != asset_code.upper().strip():
+                        continue
+                    
+                    price = obj.get("price", None)
+                    if price is not None:
+                        try:
+                            return float(price)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        
+        return None
 
     def get_price(self, symbols: list) -> Dict[str, float]:
         buy_prices = {}
@@ -1215,27 +1733,36 @@ class CryptoAPITrading:
         valid_symbols = []
 
         for symbol in symbols:
-            if symbol == "USDC-USD":
+            if symbol == "USDC-USD" or symbol == "USDT-USD":
                 continue
 
-            path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-            response = self.make_api_request("GET", path)
-
-            if response and "results" in response:
-                result = response["results"][0]
-                ask = float(result["ask_inclusive_of_buy_spread"])
-                bid = float(result["bid_inclusive_of_sell_spread"])
-
-                buy_prices[symbol] = ask
-                sell_prices[symbol] = bid
-                valid_symbols.append(symbol)
-
-                # Update cache for transient failures later
-                try:
-                    self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
-                except Exception:
-                    pass
-            else:
+            # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
+            kucoin_symbol = symbol.replace("-USD", "-USDT")
+            
+            # KuCoin: Get ticker data (public endpoint, no auth needed)
+            try:
+                url = f"{self.base_url}/api/v1/market/orderbook/level1"
+                params = {"symbol": kucoin_symbol}
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data and "data" in data:
+                    ticker_data = data["data"]
+                    ask = float(ticker_data.get("bestAsk", 0.0) or 0.0)
+                    bid = float(ticker_data.get("bestBid", 0.0) or 0.0)
+                    
+                    if ask > 0.0 and bid > 0.0:
+                        buy_prices[symbol] = ask
+                        sell_prices[symbol] = bid
+                        valid_symbols.append(symbol)
+                        
+                        # Update cache for transient failures later
+                        try:
+                            self._last_good_bid_ask[symbol] = {"ask": ask, "bid": bid, "ts": time.time()}
+                        except Exception:
+                            pass
+            except Exception:
                 # Fallback to cached bid/ask so account value never drops due to a transient miss
                 cached = None
                 try:
@@ -1267,7 +1794,13 @@ class CryptoAPITrading:
     ) -> Any:
         # Fetch the current price of the asset (for sizing only)
         current_buy_prices, current_sell_prices, valid_symbols = self.get_price([symbol])
+        if symbol not in current_buy_prices:
+            print(f"[TRADER] Failed to get price for {symbol}. Symbol may not be available or API error.")
+            return None
         current_price = current_buy_prices[symbol]
+        if current_price <= 0:
+            print(f"[TRADER] Invalid price for {symbol}: {current_price}")
+            return None
         asset_quantity = amount_in_usd / current_price
 
         max_retries = 5
@@ -1280,24 +1813,100 @@ class CryptoAPITrading:
                 # Default precision to 8 decimals initially
                 rounded_quantity = round(asset_quantity, 8)
 
+                # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
+                kucoin_symbol = symbol.replace("-USD", "-USDT")
+                
+                # Get symbol info to validate minFunds and other constraints
+                symbol_info = self.get_symbol_info(symbol)
+                quote_increment = None
+                if symbol_info:
+                    min_funds = float(symbol_info.get("minFunds", 0.0) or 0.0)
+                    if amount_in_usd < min_funds:
+                        print(f"[TRADER] Order amount ${amount_in_usd:.2f} is below minimum funds ${min_funds:.2f} for {symbol}")
+                        return None
+                    
+                    # Get quote increment (funds must be a multiple of this)
+                    quote_increment = symbol_info.get("quoteIncrement") or symbol_info.get("fundsIncrement")
+                    if quote_increment:
+                        try:
+                            quote_increment = float(quote_increment)
+                        except Exception:
+                            quote_increment = None
+                
+                # KuCoin market buy orders require "funds" (amount in quote currency), not "size"
+                # For market buy: use "funds" parameter with the USD amount
+                # For market sell: use "size" parameter with the base currency amount
                 body = {
-                    "client_order_id": client_order_id,
-                    "side": side,
-                    "type": order_type,
-                    "symbol": symbol,
-                    "market_order_config": {
-                        "asset_quantity": f"{rounded_quantity:.8f}"  # Start with 8 decimal places
-                    }
+                    "clientOid": client_order_id,
+                    "side": side.lower(),
+                    "symbol": kucoin_symbol,
+                    "type": "market",
                 }
+                
+                if side.lower() == "buy":
+                    # Market buy: specify funds in quote currency (USDT)
+                    # Round funds to match quoteIncrement if available
+                    funds_amount = amount_in_usd
+                    if quote_increment and quote_increment > 0:
+                        # Round down to nearest increment (floor division)
+                        funds_amount = math.floor(funds_amount / quote_increment) * quote_increment
+                        # Determine decimal places from quote_increment
+                        if quote_increment >= 1:
+                            decimal_places = 0
+                        else:
+                            # Count decimal places in quote_increment
+                            decimal_str = str(quote_increment).rstrip('0')
+                            if '.' in decimal_str:
+                                decimal_places = len(decimal_str.split('.')[1])
+                            else:
+                                decimal_places = 0
+                        funds_amount = round(funds_amount, decimal_places)
+                        print(f"[TRADER] Rounded funds for {symbol} to ${funds_amount:.8f} (increment: {quote_increment})")
+                    else:
+                        # Fallback: round to 2 decimal places for USDT (standard)
+                        funds_amount = round(funds_amount, 2)
+                        print(f"[TRADER] Using fallback rounding for {symbol}: ${funds_amount:.2f} (quoteIncrement not available)")
+                    
+                    # Ensure we don't go below minimum
+                    if symbol_info:
+                        min_funds = float(symbol_info.get("minFunds", 0.0) or 0.0)
+                        if funds_amount < min_funds:
+                            print(f"[TRADER] Rounded funds ${funds_amount:.8f} is below minimum funds ${min_funds:.2f} for {symbol}")
+                            return None
+                    
+                    body["funds"] = str(funds_amount)
+                else:
+                    # Market sell: specify size in base currency
+                    body["size"] = str(rounded_quantity)
 
-                path = "/api/v1/crypto/trading/orders/"
+                path = "/api/v1/orders"
 
                 # --- exact profit tracking snapshot (BEFORE placing order) ---
                 buying_power_before = self._get_buying_power()
 
                 response = self.make_api_request("POST", path, json.dumps(body))
-                if response and "errors" not in response:
-                    order_id = response.get("id", None)
+                if not response:
+                    print(f"[TRADER] Failed to place buy order for {symbol}: API returned None")
+                    print(f"[TRADER] Request body was: {json.dumps(body)}")
+                    retries += 1
+                    continue
+                if "errors" in response or "code" in response:
+                    # KuCoin returns errors in different formats
+                    error_msg = response.get("msg", response.get("message", "Unknown error"))
+                    error_code = response.get("code", "N/A")
+                    errors_list = response.get("errors", [])
+                    print(f"[TRADER] API returned errors for {symbol}:")
+                    print(f"[TRADER]   Code: {error_code}")
+                    print(f"[TRADER]   Message: {error_msg}")
+                    if errors_list:
+                        print(f"[TRADER]   Errors: {errors_list}")
+                    print(f"[TRADER]   Request body: {json.dumps(body)}")
+                    # Continue to error handling below
+                elif response:
+                    # KuCoin create-order returns {"code": "...", "data": {"orderId": "..."}}.
+                    # make_api_request() unwraps to the inner "data" dict, which usually
+                    # contains "orderId" (and not "id"). Support both for safety.
+                    order_id = response.get("id") or response.get("orderId")
 
                     # Persist the pre-order buying power so restarts can reconcile precisely
                     try:
@@ -1319,7 +1928,16 @@ class CryptoAPITrading:
                     # Wait until the order is actually complete in the system, then use order history executions
                     if order_id:
                         order = self._wait_for_order_terminal(symbol, order_id)
-                        state = str(order.get("state", "")).lower().strip() if isinstance(order, dict) else ""
+                        if not order or not isinstance(order, dict):
+                            # Order status check failed or timed out -> clear pending and do not record a trade
+                            try:
+                                self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
+                                self._save_pnl_ledger()
+                            except Exception:
+                                pass
+                            return None
+                        
+                        state = str(order.get("state", "")).lower().strip()
                         if state != "filled":
                             # Not filled -> clear pending and do not record a trade
                             try:
@@ -1358,22 +1976,47 @@ class CryptoAPITrading:
 
                     return response  # Successfully placed (and fully filled) order
 
-            except Exception:
-                pass #print(traceback.format_exc())
+            except Exception as e:
+                print(f"[TRADER] Exception in place_buy_order for {symbol}: {e}")
+                print(traceback.format_exc())
 
-            # Check for precision errors
-            if response and "errors" in response:
-                for error in response["errors"]:
-                    if "has too much precision" in error.get("detail", ""):
+            # Check for precision errors and other retryable errors
+            if response and ("errors" in response or "code" in response):
+                errors_list = response.get("errors", [])
+                error_msg = str(response.get("msg", response.get("message", ""))).lower()
+                
+                # Check if it's a precision error that we can retry
+                retryable = False
+                for error in errors_list:
+                    detail = str(error.get("detail", error.get("msg", ""))).lower()
+                    if "has too much precision" in detail or "precision" in detail:
                         # Extract required precision directly from the error message
-                        detail = error["detail"]
-                        nearest_value = detail.split("nearest ")[1].split(" ")[0]
-
-                        decimal_places = len(nearest_value.split(".")[1].rstrip("0"))
-                        asset_quantity = round(asset_quantity, decimal_places)
-                        break
-                    elif "must be greater than or equal to" in error.get("detail", ""):
+                        try:
+                            nearest_value = detail.split("nearest ")[1].split(" ")[0]
+                            decimal_places = len(nearest_value.split(".")[1].rstrip("0"))
+                            asset_quantity = round(asset_quantity, decimal_places)
+                            retryable = True
+                            break
+                        except Exception:
+                            pass
+                    elif "must be greater than or equal to" in detail or "minimum" in detail:
+                        # Minimum size/funds error - can't retry
+                        print(f"[TRADER] Minimum size/funds error for {symbol}: {error}")
                         return None
+                
+                # Check error code for common issues
+                error_code = response.get("code", "")
+                if error_code in ["400001", "400003", "400005"]:
+                    # Authentication errors - don't retry
+                    print(f"[TRADER] Authentication error for {symbol}: {error_code}")
+                    return None
+                elif "insufficient" in error_msg or "balance" in error_msg:
+                    # Insufficient funds - don't retry
+                    print(f"[TRADER] Insufficient funds for {symbol}")
+                    return None
+                elif not retryable:
+                    # Non-retryable error
+                    return None
 
         return None
 
@@ -1391,17 +2034,19 @@ class CryptoAPITrading:
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
     ) -> Any:
+        # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
+        kucoin_symbol = symbol.replace("-USD", "-USDT")
+        
+        # KuCoin order body format
         body = {
-            "client_order_id": client_order_id,
-            "side": side,
-            "type": order_type,
-            "symbol": symbol,
-            "market_order_config": {
-                "asset_quantity": f"{asset_quantity:.8f}"
-            }
+            "clientOid": client_order_id,
+            "side": side.lower(),
+            "symbol": kucoin_symbol,
+            "type": "market",
+            "size": str(asset_quantity),  # Quantity in base currency
         }
 
-        path = "/api/v1/crypto/trading/orders/"
+        path = "/api/v1/orders"
 
         # --- exact profit tracking snapshot (BEFORE placing order) ---
         buying_power_before = self._get_buying_power()
@@ -1409,7 +2054,10 @@ class CryptoAPITrading:
         response = self.make_api_request("POST", path, json.dumps(body))
 
         if response and isinstance(response, dict) and "errors" not in response:
-            order_id = response.get("id", None)
+            # KuCoin create-order returns {"code": "...", "data": {"orderId": "..."}}.
+            # make_api_request() unwraps to that inner dict, so prefer "orderId" but
+            # also accept "id" for compatibility with any alternate shapes.
+            order_id = response.get("id") or response.get("orderId")
 
             # Persist the pre-order buying power so restarts can reconcile precisely
             try:
@@ -1849,6 +2497,7 @@ class CryptoAPITrading:
 
 
             # --- Trailing profit margin (0.5% trail gap) ---
+            # avg_cost_basis = full weighted average over ALL BUY + DCA levels (not just last DCA).
             # PM "start line" is the normal 5% / 2.5% line (depending on DCA levels hit).
             # Trailing activates once price is ABOVE the PM start line, then line follows peaks up
             # by 0.5%. Forced sell happens ONLY when price goes from ABOVE the trailing line to BELOW it.
@@ -2134,7 +2783,11 @@ class CryptoAPITrading:
                 time.sleep(5)
                 holdings = self.get_holdings()
                 holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
-
+            else:
+                if response and "errors" in response:
+                    print(f"[TRADER] Failed to start trade for {full_symbol}: {response.get('errors', 'Unknown error')}")
+                else:
+                    print(f"[TRADER] Failed to start trade for {full_symbol}: Order placement returned None or invalid response")
 
             start_index += 1
 

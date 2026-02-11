@@ -18,102 +18,38 @@ import logging
 import json
 import uuid
 
-from nacl.signing import SigningKey
+# Removed nacl.signing import - no longer needed for KuCoin public market data
 
 # -----------------------------
-# Robinhood market-data (current ASK), same source as rhcb.py trader:
-#   GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
-#   use result["ask_inclusive_of_buy_spread"]
+# KuCoin market-data (current price)
+#   Uses KuCoin Market client to get ticker data
 # -----------------------------
-ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
 
-_RH_MD = None  # lazy-init so import doesn't explode if creds missing
-
-
-class RobinhoodMarketData:
-    def __init__(self, api_key: str, base64_private_key: str, base_url: str = ROBINHOOD_BASE_URL, timeout: int = 10):
-        self.api_key = (api_key or "").strip()
-        self.base_url = (base_url or "").rstrip("/")
-        self.timeout = timeout
-
-        if not self.api_key:
-            raise RuntimeError("Robinhood API key is empty (r_key.txt).")
-
+def kucoin_current_price(symbol: str) -> float:
+    """
+    Returns KuCoin current price for symbols like 'BTC-USD' (converts to 'BTC-USDT' for KuCoin).
+    Uses the global market client instance.
+    """
+    # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
+    symbol_upper = (symbol or "").strip().upper()
+    if symbol_upper.endswith("-USD"):
+        kucoin_symbol = symbol_upper.replace("-USD", "-USDT")
+    else:
+        kucoin_symbol = symbol_upper
+    
+    while True:
         try:
-            raw_private = base64.b64decode((base64_private_key or "").strip())
-            self.private_key = SigningKey(raw_private)
+            ticker = market.get_ticker(kucoin_symbol)
+            if ticker and "price" in ticker:
+                return float(ticker["price"])
+            elif ticker and "data" in ticker and "price" in ticker["data"]:
+                return float(ticker["data"]["price"])
+            else:
+                raise RuntimeError(f"KuCoin ticker returned unexpected format for {kucoin_symbol}: {ticker}")
         except Exception as e:
-            raise RuntimeError(f"Failed to decode Robinhood private key (r_secret.txt): {e}")
-
-        self.session = requests.Session()
-
-    def _get_current_timestamp(self) -> int:
-        return int(time.time())
-
-    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> dict:
-        # matches the trader's signing format
-        method = method.upper()
-        body = body or ""
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        signature_b64 = base64.b64encode(signed.signature).decode("utf-8")
-
-        return {
-            "x-api-key": self.api_key,
-            "x-timestamp": str(timestamp),
-            "x-signature": signature_b64,
-            "Content-Type": "application/json",
-        }
-
-    def make_api_request(self, method: str, path: str, body: str = "") -> dict:
-        url = f"{self.base_url}{path}"
-        ts = self._get_current_timestamp()
-        headers = self._get_authorization_header(method, path, body, ts)
-
-        resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Robinhood HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
-
-    def get_current_ask(self, symbol: str) -> float:
-        symbol = (symbol or "").strip().upper()
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-        data = self.make_api_request("GET", path)
-
-        if not data or "results" not in data or not data["results"]:
-            raise RuntimeError(f"Robinhood best_bid_ask returned no results for {symbol}: {data}")
-
-        result = data["results"][0]
-        # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
-        return float(result["ask_inclusive_of_buy_spread"])
-
-
-def robinhood_current_ask(symbol: str) -> float:
-    """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
-    """
-    global _RH_MD
-    if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
-
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
-
-
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
-
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
-
-    return _RH_MD.get_current_ask(symbol)
+            # Retry on errors
+            time.sleep(0.5)
+            continue
 
 
 def restart_program():
@@ -730,11 +666,11 @@ def step_coin(sym: str):
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
 		tf_update = ['no'] * len(tf_choices)
 
-		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
-		rh_symbol = f"{sym}-USD"
+		# get current price ONCE per coin — use KuCoin's current price
+		kucoin_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = kucoin_current_price(kucoin_symbol)
 				break
 			except Exception as e:
 				print(e)
