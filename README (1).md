@@ -76,7 +76,7 @@ For determining when to sell, the bot uses a trailing profit margin to maximize 
 THESE INSTRUCTIONS WERE WRITTEN BY AI! PLEASE LET ME KNOW IF THERE ARE ANY ERRORS OR ISSUES WITH THIS SETUP PROCESS!
 
 If you already have open spot positions on the **same KuCoin account** (for coins you plan to let the bot trade), be aware that PowerTrader will treat those holdings as part of its managed positions.  
-For najčistejšie správanie je dobré začínať s **čistým KuCoin trade účtom / prázdnymi zostatkami** na vybraných coinoch, alebo aspoň vedieť, že bot bude DCA-ovať a predávať na základe *celého* množstva, ktoré na týchto coinoch na KuCoine vidí.
+For the cleanest behavior, many users prefer to start with a **fresh KuCoin trade account / zero balances** on the coins managed by the bot, or at least understand that the bot will DCA and sell based on the *entire* quantity it sees for those coins on KuCoin.
 
 This page walks you through installing PowerTrader AI from start to finish, in the exact order a first-time user should do it.  
 No coding knowledge needed.  
@@ -136,35 +136,35 @@ This is the only thing you need to run day-to-day.
 
 ### Open Settings
 
-V Hube otvor **Settings** a postupuj v tomto poradí:
+In the Hub, open **Settings** and follow these steps:
 
-- **Main Neural Folder** – nastav na rovnaký priečinok, v ktorom máš `pt_hub.py` (najjednoduchšia voľba).  
-- **Coins (comma)** – zadaj zoznam coinov, napr. `BTC,ETH,SOL,BNB,XRP`. Bot bude pre tieto coiny trénovať AI a obchodovať páry `COIN-USDT` na KuCoine.
+- **Main Neural Folder** – set this to the same folder that contains `pt_hub.py` (easiest option).  
+- **Coins (comma)** – enter a comma‑separated list of coins, e.g. `BTC,ETH,SOL,BNB,XRP`. The bot will train the AI and trade `COIN-USDT` pairs on KuCoin for these symbols.
 
-Potom v spodnej časti okna nájdeš sekciu **KuCoin API**:
+Then, near the bottom of the window, you will see the **KuCoin API** section:
 
-1. Klikni **Setup Wizard**.
-2. Na webe **KuCoin → API Management** vytvor nový API kľúč:
-   - povoľ oprávnenia aspoň **General** a **Trade** (spot trading),
-   - nastav vlastný **Passphrase** (zapamätaj si ju).
-3. Z KuCoin si skopíruj:
+1. Click **Setup Wizard**.
+2. On the KuCoin website go to **API Management** and create a new API key:
+   - enable at least the **General** and **Trade** permissions (spot trading),  
+   - choose your own **Passphrase** (remember it).
+3. From KuCoin, copy:
    - **API Key**,  
    - **API Secret**,  
    - **Passphrase**.
-4. Tieto tri hodnoty vlož do polí v sprievodcovi v Hube (**API Key / API Secret / Passphrase**).
-5. Voliteľne klikni na **Test Connection** (overí, že sa vie pripojiť aspoň na verejné API).
-6. Klikni **Save**.
+4. Paste these three values into the wizard fields in the Hub (**API Key / API Secret / Passphrase**).
+5. Optionally click **Test Connection** (checks that the app can reach KuCoin’s public API).
+6. Click **Save**.
 
-Po uložení sa v priečinku projektu vytvoria tri súbory:
+After saving, three files will be created in your project folder:
 
 - `k_key.txt` – KuCoin API Key  
 - `k_secret.txt` – KuCoin API Secret  
 - `k_pass.txt` – KuCoin API Passphrase  
 
-Tieto súbory obsahujú citlivé údaje – **uchovávaj ich v súkromí** a nikdy ich nikomu neposielaj.
+These files contain sensitive credentials – **keep them private** and never share them with anyone.
 
-PowerTrader AI používa jednoduchú štruktúru priečinkov:  
-**BTC používa hlavný priečinok**, ostatné coiny svoje podpriečinky (napr. `ETH\`), rovnako ako v originálnej verzii.
+PowerTrader AI uses a simple folder layout:  
+**BTC uses the main folder**, and other coins use their own subfolders (e.g. `ETH\`), just like in the original version.
 
 ---
 
