@@ -488,29 +488,77 @@ class CryptoAPITrading:
         return 0.0
 
     def _get_order_by_id(self, symbol: str, order_id: str) -> Optional[dict]:
+        """
+        Fetch a single order from KuCoin and normalize fields, but keep raw
+        dealFunds/dealSize so cost basis and PnL can use the exact fill price.
+        """
         try:
-            # KuCoin: Get order by ID directly
-            kucoin_symbol = symbol.replace("-USD", "-USDT")
             path = f"/api/v1/orders/{order_id}"
             order = self.make_api_request("GET", path)
-            
-            if order and isinstance(order, dict):
-                # Convert to format similar to Robinhood
-                return {
-                    "id": order.get("id", ""),
-                    "symbol": symbol,  # Keep original symbol format
-                    "side": order.get("side", "").lower(),
-                    "type": order.get("type", "").lower(),
-                    "state": order.get("status", "").lower(),
-                    "quantity": str(order.get("size", 0.0) or 0.0),
-                    "filled_quantity": str(order.get("filledSize", 0.0) or 0.0),
-                    "price": str(order.get("price", 0.0) or 0.0),
-                    "created_at": order.get("createdAt", 0),
-                    "executions": [],  # KuCoin doesn't provide executions in order response
-                }
+
+            if not isinstance(order, dict):
+                return None
+
+            state = str(order.get("status") or order.get("state") or "").lower().strip()
+            filled_qty = (
+                order.get("filledSize")
+                or order.get("dealSize")
+                or order.get("filled_quantity")
+                or "0"
+            )
+            price = order.get("price") or "0"
+
+            normalized = {
+                "id": order.get("id", order_id),
+                "symbol": symbol,  # Keep original symbol format
+                "side": (order.get("side") or "").lower(),
+                "type": (order.get("type") or "").lower(),
+                "state": state,
+                "quantity": str(order.get("size") or order.get("quantity") or 0.0),
+                "filled_quantity": str(filled_qty),
+                "price": str(price),
+                "created_at": order.get("createdAt") or order.get("created_at") or 0,
+                # Total cost and size for filled market orders
+                "deal_funds": str(order.get("dealFunds") or order.get("deal_funds") or 0.0),
+                "deal_size": str(order.get("dealSize") or order.get("deal_size") or 0.0),
+                # Store raw KuCoin payload for any further inspection
+                "_raw": order,
+                "_raw_isActive": order.get("isActive"),
+            }
+            return normalized
+        except Exception as e:
+            print(f"[TRADER] _get_order_by_id error for {symbol} {order_id}: {e}")
+            return None
+
+    def _is_order_filled(self, order: dict) -> bool:
+        """
+        Normalized check whether an order is fully filled (for KuCoin).
+
+        Accepts:
+        - explicit state 'filled' or 'done' with filledSize/dealSize > 0
+        - OR any order with filled_quantity > 0 and not active
+        """
+        if not isinstance(order, dict):
+            return False
+
+        state = str(order.get("state") or order.get("status") or "").lower().strip()
+        is_active = bool(order.get("_raw_isActive", order.get("isActive", False)))
+
+        try:
+            fq = float(
+                order.get("filled_quantity")
+                or order.get("filledSize")
+                or order.get("dealSize")
+                or 0.0
+            )
         except Exception:
-            pass
-        return None
+            fq = 0.0
+
+        if state in ("filled", "done"):
+            return fq > 0.0
+
+        # Fallback: infer from filled qty + not active
+        return (not is_active) and fq > 0.0
 
     def _extract_fill_from_order(self, order: dict) -> tuple:
         """Returns (filled_qty, avg_fill_price). avg_fill_price may be None."""
@@ -690,11 +738,11 @@ class CryptoAPITrading:
 
                         order = self._wait_for_order_terminal(symbol, order_id)
                         if not order:
+                            # Still no terminal state (timeout) -> leave pending for next reconcile pass
                             continue
 
-                        state = str(order.get("state", "")).lower().strip()
-                        if state != "filled":
-                            # Not filled -> no trade to record, clear pending.
+                        if not self._is_order_filled(order):
+                            # Terminal but not filled (cancelled/rejected/...) -> clear pending, nothing to record.
                             self._pnl_ledger["pending_orders"].pop(order_id, None)
                             self._save_pnl_ledger()
                             progressed = True
@@ -1501,14 +1549,12 @@ class CryptoAPITrading:
             for idx, order in enumerate(all_orders_list):
                 print(f"[TRADER]   Order {idx+1}: side={order.get('side', 'N/A')}, state={order.get('state', 'N/A')}, type={order.get('type', 'N/A')}, filled_qty={order.get('filled_quantity', 'N/A')}, price={order.get('price', 'N/A')}")
             
-            # Match buy orders that are filled (state="filled"/"done" OR have filled_quantity > 0)
+            # Match buy orders that are actually filled according to KuCoin state/filledSize
             buy_orders = [
-                order for order in all_orders_list
-                if order.get("side") == "buy" and (
-                    order.get("state") == "filled" or 
-                    order.get("state") == "done" or
-                    float(order.get("filled_quantity") or order.get("quantity") or "0") > 0
-                )
+                order
+                for order in all_orders_list
+                if str(order.get("side", "")).lower() == "buy"
+                and self._is_order_filled(order)
             ]
             
             print(f"[TRADER] Found {len(buy_orders)} filled buy orders for {asset_code}")
@@ -1929,23 +1975,18 @@ class CryptoAPITrading:
                     if order_id:
                         order = self._wait_for_order_terminal(symbol, order_id)
                         if not order or not isinstance(order, dict):
-                            # Order status check failed or timed out -> clear pending and do not record a trade
+                            # Unknown status (timeout / transient error) -> leave in pending and let reconcile handle it
+                            print(f"[TRADER] Order {order_id} for {symbol} timed out waiting for terminal state; leaving in pending for reconcile.")
+                            return response
+
+                        if not self._is_order_filled(order):
+                            # Terminal but not filled (cancelled/rejected/...) -> clear pending and do not record a trade
                             try:
                                 self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                                 self._save_pnl_ledger()
                             except Exception:
                                 pass
-                            return None
-                        
-                        state = str(order.get("state", "")).lower().strip()
-                        if state != "filled":
-                            # Not filled -> clear pending and do not record a trade
-                            try:
-                                self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
-                                self._save_pnl_ledger()
-                            except Exception:
-                                pass
-                            return None
+                            return response
 
                         filled_qty, avg_fill_price = self._extract_fill_from_order(order)
 
@@ -2037,13 +2078,40 @@ class CryptoAPITrading:
         # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
         kucoin_symbol = symbol.replace("-USD", "-USDT")
         
+        # Normalize quantity to KuCoin's base increment / min size
+        normalized_qty = float(asset_quantity)
+        try:
+            symbol_info = self.get_symbol_info(symbol)
+            if symbol_info:
+                raw_step = (
+                    symbol_info.get("baseIncrement")
+                    or symbol_info.get("baseIncrementSize")
+                    or symbol_info.get("baseMinSize")
+                )
+                step = float(raw_step or 0.0)
+                if step > 0:
+                    steps = math.floor(normalized_qty / step)
+                    normalized_qty = steps * step
+
+                raw_min = symbol_info.get("baseMinSize") or symbol_info.get("minFunds")
+                min_size = float(raw_min or 0.0)
+                if min_size > 0 and normalized_qty < min_size:
+                    print(f"[TRADER] Normalized sell size {normalized_qty:.8f} for {symbol} is below minSize {min_size:.8f}; skipping sell.")
+                    return None
+        except Exception:
+            pass
+
+        if normalized_qty <= 0.0:
+            print(f"[TRADER] Normalized sell size for {symbol} is <= 0; skipping sell.")
+            return None
+
         # KuCoin order body format
         body = {
             "clientOid": client_order_id,
             "side": side.lower(),
             "symbol": kucoin_symbol,
             "type": "market",
-            "size": str(asset_quantity),  # Quantity in base currency
+            "size": str(normalized_qty),  # Quantity in base currency
         }
 
         path = "/api/v1/orders"
@@ -2105,10 +2173,12 @@ class CryptoAPITrading:
                 if order_id:
                     match = self._wait_for_order_terminal(symbol, order_id)
                     if not match:
+                        # Unknown status (timeout) -> leave pending and let reconcile handle it
+                        print(f"[TRADER] Sell order {order_id} for {symbol} timed out waiting for terminal state; leaving in pending for reconcile.")
                         return response
 
-                    if str(match.get("state", "")).lower() != "filled":
-                        # Not filled -> clear pending and do not record a trade
+                    if not self._is_order_filled(match):
+                        # Terminal but not filled (cancelled/rejected/...) -> clear pending and do not record a trade
                         try:
                             self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                             self._save_pnl_ledger()
@@ -2606,12 +2676,15 @@ class CryptoAPITrading:
             hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
             hard_hit = gain_loss_percentage_buy <= hard_level
 
-            # Neural trigger only for first 4 DCA stages
+            # Neural trigger uses same scheme as the DCA display (depends on TRADE_START_LEVEL)
+            start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
+            neural_dca_max = max(0, 7 - start_level)
+
             neural_level_needed = None
             neural_level_now = None
             neural_hit = False
-            if current_stage < 4:
-                neural_level_needed = current_stage + 4
+            if current_stage < neural_dca_max:
+                neural_level_needed = start_level + 1 + current_stage
                 neural_level_now = self._read_long_dca_signal(symbol)
 
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.
