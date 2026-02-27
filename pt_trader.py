@@ -5,6 +5,7 @@ import uuid
 import time
 import math
 from typing import Any, Dict, Optional
+from decimal import Decimal, ROUND_DOWN
 import requests
 import os
 import colorama
@@ -2078,22 +2079,30 @@ class CryptoAPITrading:
         # Convert symbol format from "BTC-USD" to "BTC-USDT" for KuCoin
         kucoin_symbol = symbol.replace("-USD", "-USDT")
         
-        # Normalize quantity to KuCoin's base increment / min size
+        # Normalize quantity to KuCoin's base increment / min size (use Decimal to avoid float artifacts)
         normalized_qty = float(asset_quantity)
+        normalized_qty_str = None
         try:
             symbol_info = self.get_symbol_info(symbol)
             if symbol_info:
                 raw_step = (
                     symbol_info.get("baseIncrement")
                     or symbol_info.get("baseIncrementSize")
-                    or symbol_info.get("baseMinSize")
                 )
                 step = float(raw_step or 0.0)
                 if step > 0:
-                    steps = math.floor(normalized_qty / step)
-                    normalized_qty = steps * step
+                    q = Decimal(str(asset_quantity))
+                    s = Decimal(str(raw_step))
+                    n_steps = (q / s).to_integral_value(rounding=ROUND_DOWN)
+                    qn = n_steps * s
+                    # Use fixed-point string (no scientific notation)
+                    normalized_qty_str = format(qn, "f")
+                    try:
+                        normalized_qty = float(normalized_qty_str)
+                    except Exception:
+                        normalized_qty = float(qn)
 
-                raw_min = symbol_info.get("baseMinSize") or symbol_info.get("minFunds")
+                raw_min = symbol_info.get("baseMinSize")
                 min_size = float(raw_min or 0.0)
                 if min_size > 0 and normalized_qty < min_size:
                     print(f"[TRADER] Normalized sell size {normalized_qty:.8f} for {symbol} is below minSize {min_size:.8f}; skipping sell.")
@@ -2111,7 +2120,8 @@ class CryptoAPITrading:
             "side": side.lower(),
             "symbol": kucoin_symbol,
             "type": "market",
-            "size": str(normalized_qty),  # Quantity in base currency
+            # Quantity in base currency (send as precise decimal string when possible)
+            "size": str(normalized_qty) if not normalized_qty_str else normalized_qty_str,
         }
 
         path = "/api/v1/orders"
@@ -2121,139 +2131,168 @@ class CryptoAPITrading:
 
         response = self.make_api_request("POST", path, json.dumps(body))
 
-        if response and isinstance(response, dict) and "errors" not in response:
-            # KuCoin create-order returns {"code": "...", "data": {"orderId": "..."}}.
-            # make_api_request() unwraps to that inner dict, so prefer "orderId" but
-            # also accept "id" for compatibility with any alternate shapes.
-            order_id = response.get("id") or response.get("orderId")
+        # If API call failed or returned a non-dict, treat as no trade
+        if not response or not isinstance(response, dict):
+            print(f"[TRADER] Failed to place sell order for {symbol}: API returned {response}")
+            return None
 
-            # Persist the pre-order buying power so restarts can reconcile precisely
+        # KuCoin error responses come back with a "code"/"msg" (and sometimes "errors")
+        if "errors" in response or "code" in response:
+            error_msg = response.get("msg", response.get("message", "Unknown error"))
+            error_code = response.get("code", "N/A")
+            errors_list = response.get("errors", [])
+            print(f"[TRADER] API returned errors for sell {symbol}:")
+            print(f"[TRADER]   Code: {error_code}")
+            print(f"[TRADER]   Message: {error_msg}")
+            if errors_list:
+                print(f"[TRADER]   Errors: {errors_list}")
+            # Do not fabricate a trade entry on any error
+            return None
+
+        # KuCoin create-order returns {"code": "...", "data": {"orderId": "..."}}.
+        # make_api_request() unwraps to that inner dict, which should contain "orderId".
+        order_id = response.get("id") or response.get("orderId")
+        if not order_id:
+            # Without a concrete order id we cannot reconcile or trust this as a real trade.
+            print(f"[TRADER] Sell order response missing orderId for {symbol}: {response}")
+            return None
+
+        # Persist the pre-order buying power so restarts can reconcile precisely
+        try:
+            self._pnl_ledger.setdefault("pending_orders", {})
+            self._pnl_ledger["pending_orders"][order_id] = {
+                "symbol": symbol,
+                "side": "sell",
+                "buying_power_before": float(buying_power_before),
+                "avg_cost_basis": float(avg_cost_basis) if avg_cost_basis is not None else None,
+                "pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
+                "tag": tag,
+                "created_ts": time.time(),
+            }
+            self._save_pnl_ledger()
+        except Exception:
+            pass
+
+        # Track whether we actually recorded a trade, so callers (trailing PM) don't
+        # assume success when KuCoin rejected/cancelled the order.
+        if isinstance(response, dict):
+            response["recorded_trade"] = False
+
+        # Best-effort: pull actual avg fill price + fees from order executions
+        actual_price = float(expected_price) if expected_price is not None else None
+        # Prefer normalized qty (what we actually submitted)
+        actual_qty = float(normalized_qty)
+        fees_usd = None
+
+        def _fee_to_float(v: Any) -> float:
             try:
-                if order_id:
-                    self._pnl_ledger.setdefault("pending_orders", {})
-                    self._pnl_ledger["pending_orders"][order_id] = {
-                        "symbol": symbol,
-                        "side": "sell",
-                        "buying_power_before": float(buying_power_before),
-                        "avg_cost_basis": float(avg_cost_basis) if avg_cost_basis is not None else None,
-                        "pnl_pct": float(pnl_pct) if pnl_pct is not None else None,
-                        "tag": tag,
-                        "created_ts": time.time(),
-                    }
-                    self._save_pnl_ledger()
+                if v is None:
+                    return 0.0
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str):
+                    return float(v)
+                if isinstance(v, dict):
+                    # common shapes: {"amount": "0.12"}, {"value": 0.12}, etc.
+                    for k in ("amount", "value", "usd_amount", "fee", "quantity"):
+                        if k in v:
+                            try:
+                                return float(v[k])
+                            except Exception:
+                                continue
+                return 0.0
+            except Exception:
+                return 0.0
+
+        try:
+            if order_id:
+                match = self._wait_for_order_terminal(symbol, order_id)
+                if not match:
+                    # Unknown status (timeout) -> leave pending and let reconcile handle it
+                    print(f"[TRADER] Sell order {order_id} for {symbol} timed out waiting for terminal state; leaving in pending for reconcile.")
+                    return response
+
+                if not self._is_order_filled(match):
+                    # Terminal but not filled (cancelled/rejected/...) -> clear pending and do not record a trade
+                    try:
+                        self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
+                        self._save_pnl_ledger()
+                    except Exception:
+                        pass
+                    return response
+
+                execs = match.get("executions", []) or []
+                total_qty = 0.0
+                total_notional = 0.0
+                fee_total = 0.0
+
+                for ex in execs:
+                    try:
+                        q = float(ex.get("quantity", 0.0) or 0.0)
+                        p = float(ex.get("effective_price", 0.0) or 0.0)
+                        total_qty += q
+                        total_notional += (q * p)
+
+                        # Fees can show up under different keys; handle the common ones.
+                        for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
+                            if fk in ex:
+                                fee_total += _fee_to_float(ex.get(fk))
+                    except Exception:
+                        continue
+
+                # Some payloads include order-level fee fields too
+                for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
+                    if fk in match:
+                        fee_total += _fee_to_float(match.get(fk))
+
+                if total_qty > 0.0 and total_notional > 0.0:
+                    actual_qty = total_qty
+                    actual_price = total_notional / total_qty
+
+                fees_usd = float(fee_total) if fee_total else 0.0
+
+        except Exception:
+            pass  # print(traceback.format_exc())
+
+        # If we managed to get a better fill price, update the displayed PnL% too
+        if avg_cost_basis is not None and actual_price is not None:
+            try:
+                acb = float(avg_cost_basis)
+                if acb > 0:
+                    pnl_pct = ((float(actual_price) - acb) / acb) * 100.0
             except Exception:
                 pass
 
-            # Best-effort: pull actual avg fill price + fees from order executions
-            actual_price = float(expected_price) if expected_price is not None else None
-            actual_qty = float(asset_quantity)
-            fees_usd = None
+        # --- exact profit tracking snapshot (AFTER the order is complete) ---
+        buying_power_after = self._get_buying_power()
+        buying_power_delta = float(buying_power_after) - float(buying_power_before)
 
-            def _fee_to_float(v: Any) -> float:
-                try:
-                    if v is None:
-                        return 0.0
-                    if isinstance(v, (int, float)):
-                        return float(v)
-                    if isinstance(v, str):
-                        return float(v)
-                    if isinstance(v, dict):
-                        # common shapes: {"amount": "0.12"}, {"value": 0.12}, etc.
-                        for k in ("amount", "value", "usd_amount", "fee", "quantity"):
-                            if k in v:
-                                try:
-                                    return float(v[k])
-                                except Exception:
-                                    continue
-                    return 0.0
-                except Exception:
-                    return 0.0
+        self._record_trade(
+            side="sell",
+            symbol=symbol,
+            qty=float(actual_qty),
+            price=float(actual_price) if actual_price is not None else None,
+            avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
+            pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
+            tag=tag,
+            order_id=order_id,
+            fees_usd=float(fees_usd) if fees_usd is not None else None,
+            buying_power_before=buying_power_before,
+            buying_power_after=buying_power_after,
+            buying_power_delta=buying_power_delta,
+        )
 
-            try:
-                if order_id:
-                    match = self._wait_for_order_terminal(symbol, order_id)
-                    if not match:
-                        # Unknown status (timeout) -> leave pending and let reconcile handle it
-                        print(f"[TRADER] Sell order {order_id} for {symbol} timed out waiting for terminal state; leaving in pending for reconcile.")
-                        return response
+        # Mark that we actually recorded a trade for callers like trailing PM
+        if isinstance(response, dict):
+            response["recorded_trade"] = True
 
-                    if not self._is_order_filled(match):
-                        # Terminal but not filled (cancelled/rejected/...) -> clear pending and do not record a trade
-                        try:
-                            self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
-                            self._save_pnl_ledger()
-                        except Exception:
-                            pass
-                        return response
-
-                    execs = match.get("executions", []) or []
-                    total_qty = 0.0
-                    total_notional = 0.0
-                    fee_total = 0.0
-
-                    for ex in execs:
-                        try:
-                            q = float(ex.get("quantity", 0.0) or 0.0)
-                            p = float(ex.get("effective_price", 0.0) or 0.0)
-                            total_qty += q
-                            total_notional += (q * p)
-
-                            # Fees can show up under different keys; handle the common ones.
-                            for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                                if fk in ex:
-                                    fee_total += _fee_to_float(ex.get(fk))
-                        except Exception:
-                            continue
-
-                    # Some payloads include order-level fee fields too
-                    for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                        if fk in match:
-                            fee_total += _fee_to_float(match.get(fk))
-
-                    if total_qty > 0.0 and total_notional > 0.0:
-                        actual_qty = total_qty
-                        actual_price = total_notional / total_qty
-
-                    fees_usd = float(fee_total) if fee_total else 0.0
-
-            except Exception:
-                pass #print(traceback.format_exc())
-
-            # If we managed to get a better fill price, update the displayed PnL% too
-            if avg_cost_basis is not None and actual_price is not None:
-                try:
-                    acb = float(avg_cost_basis)
-                    if acb > 0:
-                        pnl_pct = ((float(actual_price) - acb) / acb) * 100.0
-                except Exception:
-                    pass
-
-            # --- exact profit tracking snapshot (AFTER the order is complete) ---
-            buying_power_after = self._get_buying_power()
-            buying_power_delta = float(buying_power_after) - float(buying_power_before)
-
-            self._record_trade(
-                side="sell",
-                symbol=symbol,
-                qty=float(actual_qty),
-                price=float(actual_price) if actual_price is not None else None,
-                avg_cost_basis=float(avg_cost_basis) if avg_cost_basis is not None else None,
-                pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
-                tag=tag,
-                order_id=order_id,
-                fees_usd=float(fees_usd) if fees_usd is not None else None,
-                buying_power_before=buying_power_before,
-                buying_power_after=buying_power_after,
-                buying_power_delta=buying_power_delta,
-            )
-
-            # Clear pending now that it is recorded
-            try:
-                if order_id:
-                    self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
-                    self._save_pnl_ledger()
-            except Exception:
-                pass
+        # Clear pending now that it is recorded
+        try:
+            if order_id:
+                self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
+                self._save_pnl_ledger()
+        except Exception:
+            pass
 
         return response
 
@@ -2626,35 +2665,57 @@ class CryptoAPITrading:
                     if new_line > state["line"]:
                         state["line"] = new_line
 
-                    # Forced sell on cross from ABOVE -> BELOW trailing line
-                    if state["was_above"] and (current_sell_price < state["line"]):
-                        print(
-                            f"  Trailing PM hit for {symbol}. "
-                            f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
-                        )
-                        response = self.place_sell_order(
-                            str(uuid.uuid4()),
-                            "sell",
-                            "market",
-                            full_symbol,
-                            quantity,
-                            expected_price=current_sell_price,
-                            avg_cost_basis=avg_cost_basis,
-                            pnl_pct=gain_loss_percentage_sell,
-                            tag="TRAIL_SELL",
-                        )
+                    crossed_down = current_sell_price < state["line"]
 
-                        if response and isinstance(response, dict) and "errors" not in response:
-                            trades_made = True
-                            self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                    if crossed_down:
+                        # Two možné scenáre:
+                        # 1) Normálny trailing hit: boli sme nad line a teraz sme pod ňou.
+                        # 2) Cena spadla "cez" trailing line bez toho, aby sme tick s Above=True zachytili,
+                        #    ale stále sme nad base_pm_line (stále v plánovanom profitzóne).
+                        if state["was_above"] or current_sell_price >= base_pm_line:
+                            print(
+                                f"  Trailing PM hit for {symbol}. "
+                                f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
+                            )
+                            response = self.place_sell_order(
+                                str(uuid.uuid4()),
+                                "sell",
+                                "market",
+                                full_symbol,
+                                quantity,
+                                expected_price=current_sell_price,
+                                avg_cost_basis=avg_cost_basis,
+                                pnl_pct=gain_loss_percentage_sell,
+                                tag="TRAIL_SELL",
+                            )
 
-                            # Trade ended -> reset rolling 24h DCA window for this coin
-                            self._reset_dca_window_for_trade(symbol, sold=True)
+                            # Only treat this as a completed trade if place_sell_order
+                            # actually managed to record it (order filled and written
+                            # to trade_history/pnl_ledger).
+                            if (
+                                response
+                                and isinstance(response, dict)
+                                and response.get("recorded_trade")
+                            ):
+                                trades_made = True
+                                self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
 
-                            print(f"  Successfully sold {quantity} {symbol}.")
-                            time.sleep(5)
-                            holdings = self.get_holdings()
-                            continue
+                                # Trade ended -> reset rolling 24h DCA window for this coin
+                                self._reset_dca_window_for_trade(symbol, sold=True)
+
+                                print(f"  Successfully sold {quantity} {symbol}.")
+                                time.sleep(5)
+                                holdings = self.get_holdings()
+                                continue
+                        else:
+                            # Cena spadla nielen pod trailing line, ale aj pod pôvodný PM štart line.
+                            # To znamená, že prvý beh trailing stopu sme "prepásli" (napr. počas reštartu
+                            # alebo medzitickového gapu). V takom prípade trailing bezpečne resetneme
+                            # späť na base_pm_line, aby sa nemohol natrvalo zaseknúť na starej vysokej cene.
+                            state["active"] = False
+                            state["line"] = base_pm_line
+                            state["peak"] = 0.0
+                            state["was_above"] = False
 
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
