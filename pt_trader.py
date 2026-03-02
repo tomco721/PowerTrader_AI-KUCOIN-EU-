@@ -25,6 +25,11 @@ TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
 PNL_LEDGER_PATH = os.path.join(HUB_DATA_DIR, "pnl_ledger.json")
 ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.jsonl")
 
+# Any position with USD value below this threshold is treated as "dust":
+# - ignored for trailing/DCA logic
+# - does not block starting a fresh trade in that symbol
+DUST_VALUE_USD = 1.0
+
 
 
 # Initialize colorama
@@ -2540,7 +2545,7 @@ class CryptoAPITrading:
             above_disp = False
             dist_to_trail_pct = 0.0
 
-            if avg_cost_basis > 0:
+            if avg_cost_basis > 0 and value >= DUST_VALUE_USD:
                 pm_start_pct_disp = self.pm_start_pct_no_dca if int(triggered_levels) == 0 else self.pm_start_pct_with_dca
                 base_pm_line_disp = avg_cost_basis * (1.0 + (pm_start_pct_disp / 100.0))
 
@@ -2563,6 +2568,8 @@ class CryptoAPITrading:
             file = open(symbol+'_current_price.txt', 'w+')
             file.write(str(current_buy_price))
             file.close()
+
+            is_dust = value < DUST_VALUE_USD
             positions[symbol] = {
                 "quantity": quantity,
                 "avg_cost_basis": avg_cost_basis,
@@ -2571,6 +2578,7 @@ class CryptoAPITrading:
                 "gain_loss_pct_buy": gain_loss_percentage_buy,
                 "gain_loss_pct_sell": gain_loss_percentage_sell,
                 "value_usd": value,
+                "is_dust": bool(is_dust),
                 "dca_triggered_stages": int(triggered_levels_count),
                 "next_dca_display": next_dca_display,
                 "dca_line_price": float(dca_line_price) if dca_line_price else 0.0,
@@ -2610,7 +2618,8 @@ class CryptoAPITrading:
             # PM "start line" is the normal 5% / 2.5% line (depending on DCA levels hit).
             # Trailing activates once price is ABOVE the PM start line, then line follows peaks up
             # by 0.5%. Forced sell happens ONLY when price goes from ABOVE the trailing line to BELOW it.
-            if avg_cost_basis > 0:
+            # Skip trailing logic for tiny "dust" positions; they can't be sold reliably anyway.
+            if avg_cost_basis > 0 and value >= DUST_VALUE_USD:
                 pm_start_pct = self.pm_start_pct_no_dca if int(triggered_levels) == 0 else self.pm_start_pct_with_dca
                 base_pm_line = avg_cost_basis * (1.0 + (pm_start_pct / 100.0))
                 trail_gap = self.trailing_gap_pct / 100.0  # 0.5% => 0.005
@@ -2731,11 +2740,17 @@ class CryptoAPITrading:
             #   stage 2 => neural 6 OR -10.0%
             #   stage 3 => neural 7 OR -20.0%
             # After that: hardcoded only (-30, -40, -50, then repeat -50 forever).
-            current_stage = len(self.dca_levels_triggered.get(symbol, []))
+            # Never DCA on dust-sized positions; let a fresh entry handle any future exposure.
+            if value < DUST_VALUE_USD:
+                current_stage = 0  # keep type consistent; no DCA logic will run below
+                hard_level = self.dca_levels[0]
+                hard_hit = False
+            else:
+                current_stage = len(self.dca_levels_triggered.get(symbol, []))
 
             # Hardcoded loss % for this stage (repeat last level after list ends)
-            hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
-            hard_hit = gain_loss_percentage_buy <= hard_level
+                hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
+                hard_hit = gain_loss_percentage_buy <= hard_level
 
             # Neural trigger uses same scheme as the DCA display (depends on TRADE_START_LEVEL)
             start_level = max(1, min(int(TRADE_START_LEVEL or 3), 7))
@@ -2751,7 +2766,7 @@ class CryptoAPITrading:
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.
                 neural_hit = (gain_loss_percentage_buy < 0) and (neural_level_now >= neural_level_needed)
 
-            if hard_hit or neural_hit:
+            if value >= DUST_VALUE_USD and (hard_hit or neural_hit):
                 if neural_hit and hard_hit:
                     reason = f"NEURAL L{neural_level_now}>=L{neural_level_needed} OR HARD {hard_level:.2f}%"
                 elif neural_hit:
@@ -2839,6 +2854,7 @@ class CryptoAPITrading:
                     "gain_loss_pct_buy": 0.0,
                     "gain_loss_pct_sell": 0.0,
                     "value_usd": 0.0,
+                    "is_dust": False,
                     "dca_triggered_stages": int(len(self.dca_levels_triggered.get(sym, []))),
                     "next_dca_display": "",
                     "dca_line_price": 0.0,
@@ -2863,7 +2879,19 @@ class CryptoAPITrading:
             allocation_in_usd = 0.5
 
 
-        holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
+        # Treat dust positions (value < DUST_VALUE_USD) as "not really held" so they don't block fresh entries.
+        holding_full_symbols = []
+        try:
+            for h in holdings.get("results", []):
+                base = h.get("asset_code")
+                if not base:
+                    continue
+                pos = positions.get(base.upper())
+                val = float(pos.get("value_usd", 0.0)) if pos else 0.0
+                if val >= DUST_VALUE_USD:
+                    holding_full_symbols.append(f"{base}-USD")
+        except Exception:
+            holding_full_symbols = [f"{h['asset_code']}-USD" for h in holdings.get("results", [])]
 
         start_index = 0
         while start_index < len(crypto_symbols):
