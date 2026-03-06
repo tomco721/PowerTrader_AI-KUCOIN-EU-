@@ -24,6 +24,16 @@ High‑level changes in this fork:
   API glitches do not create fake dips in the GUI or zero out account value.
 - **Settings integration**: The existing GUI **Settings** panel is reused; the “KuCoin API configured” section
   loads keys from disk and hot‑reloads DCA / PM parameters exactly like in the original bot.
+- **Startup readiness gating**: `pt_hub.py` now waits for `pt_thinker.py` to report real prediction readiness
+  before starting `pt_trader.py`, which helps avoid starting the trader on placeholder / warming-up signals.
+- **Training freshness guard**: Coins are treated as not ready if their training stamp is missing or stale,
+  so the runner and hub stay aligned about whether a coin is actually trained.
+- **Order-state hardening**: Startup no longer waits forever on broken pending orders; old unresolved orders
+  are quarantined to a stale bucket so one bad record cannot stall the whole bot.
+- **Trailing-exit retry logic**: If a profitable trailing sell fails because of a transient API issue, the
+  trader keeps a short-lived exit intent and can retry the exit while the trade is still comfortably profitable.
+- **Dust handling**: Tiny leftover positions are treated as dust so they do not block fresh entries or distort
+  DCA / trailing behavior.
 
 Important: Many sections below in this README still mention **Robinhood** and the original key setup flow.  
 For this fork, treat those Robinhood‑specific parts as historical – live trading is performed **only against
@@ -69,6 +79,18 @@ For determining when to start trades, the AI's Thinker script sends a signal to 
 For determining when to DCA, it uses either the current price level from the AI that is tied to the current amount of DCA buys that have been done on the trade (for example, right after a trade starts when 3 blue lines get crossed, its first DCA wont happen until the price crosses the 4th line, so on so forth), or it uses the hardcoded drawdown % for its current level, whichever it hits first. It only allows a max of 2 DCAs within a rolling 24hr window to keep from dumping all of your money in too quickly on coins that are having an extended downtrend. Other risk management features can easily be added, as well, with just a bit of Python code!
 
 For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade.
+
+In this fork, those trade-management values are no longer purely hardcoded. The Hub settings can control:
+
+- **Trade start level** (default `3`)
+- **Start allocation %** for the initial entry
+- **DCA multiplier**
+- **DCA levels**
+- **Max DCA buys per 24h**
+- **Trailing PM start %** for no-DCA and with-DCA trades
+- **Trailing gap %**
+
+These values are hot-reloaded by the trader while the system is running, so you can tune them from the Hub without manually editing the scripts.
 
 
 # Setup & First-Time Use (Windows)
@@ -140,6 +162,10 @@ In the Hub, open **Settings** and follow these steps:
 
 - **Main Neural Folder** – set this to the same folder that contains `pt_hub.py` (easiest option).  
 - **Coins (comma)** – enter a comma‑separated list of coins, e.g. `BTC,ETH,SOL,BNB,XRP`. The bot will train the AI and trade `COIN-USDT` pairs on KuCoin for these symbols.
+- **Trade Start Level** – default is `3` (trade starts when LONG reaches at least that level while SHORT is `0`).
+- **Start Allocation %** – controls the size of the first entry relative to total account value.
+- **DCA Multiplier / DCA Levels / Max DCA buys per 24h** – controls how aggressively the bot averages down.
+- **Trailing PM settings** – controls the base profit line and trailing gap used for exits.
 
 Then, near the bottom of the window, you will see the **KuCoin API** section:
 
@@ -175,6 +201,11 @@ Training builds the system’s coin “memory” so it can generate signals.
 1. In the Hub, click **Train All**.
 2. Wait until training finishes.
 
+Notes:
+
+- The Hub / runner now use a **training freshness** check, not just “file exists” logic.
+- If a coin is missing its training timestamp or the training is considered stale, the system will keep that coin in a not-ready state until it is retrained.
+
 ---
 
 ## Step 7 — Start the system (inside the Hub)
@@ -186,6 +217,12 @@ When all coins have completed training, click:
 The Hub will:  
 **start pt_thinker.py**, wait until it is ready, then it will **start pt_trader.py**.  
 You don’t need to manually start separate programs. The hub handles everything!
+
+Important runtime behavior in this fork:
+
+- The trader is started only after the runner reports **real prediction readiness**, not just process startup.
+- If an API hiccup causes a temporary missing price / holdings snapshot, the bot falls back to the last known-good cached values instead of writing a fake account-value crash to the GUI.
+- If a trailing sell fails for a transient reason, the trader can retry that exit for a short time while the position is still safely in profit.
 
 ---
 
