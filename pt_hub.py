@@ -1584,6 +1584,13 @@ class PowerTraderHub(tk.Tk):
         # internal: when Start All is pressed, we start the runner first and only start the trader once ready
         self._auto_start_trader_pending = False
 
+        # ---- V1 watchdog (minimal + conservative) ----
+        # Only acts on processes that are already running.
+        self._watchdog_runner_stale_sec = 30.0
+        self._watchdog_trader_stale_sec = 30.0
+        self._watchdog_restart_cooldown_sec = 60.0
+        self._watchdog_last_restart_ts: Dict[str, float] = {"neural": 0.0, "trader": 0.0}
+
 
         # cache latest trader status so charts can overlay buy/sell lines
         self._last_positions: Dict[str, dict] = {}
@@ -3153,6 +3160,74 @@ class PowerTraderHub(tk.Tk):
             pass
         return {"ready": False}
 
+    def _read_json_timestamp(self, path: str) -> Optional[float]:
+        data = _safe_read_json(path)
+        if not isinstance(data, dict):
+            return None
+        for k in ("timestamp", "ts", "last_updated_ts"):
+            if k in data:
+                try:
+                    v = float(data.get(k))
+                    if v > 0:
+                        return v
+                except Exception:
+                    continue
+        return None
+
+    def _watchdog_restart_process(self, key: str, proc: ProcInfo, start_fn, reason: str) -> None:
+        now = time.time()
+        last = float(self._watchdog_last_restart_ts.get(key, 0.0) or 0.0)
+        if (now - last) < float(self._watchdog_restart_cooldown_sec):
+            return
+
+        self._watchdog_last_restart_ts[key] = now
+        print(f"[HUB][WATCHDOG] restarting {key}: {reason}")
+
+        # graceful stop only; no hard-kill in V1
+        self._stop_process(proc)
+
+        # delayed start gives terminate() a chance to complete
+        def _start_if_stopped() -> None:
+            try:
+                if not (proc.proc and proc.proc.poll() is None):
+                    start_fn()
+            except Exception:
+                pass
+
+        try:
+            self.after(1200, _start_if_stopped)
+        except Exception:
+            pass
+
+    def _watchdog_health_check(self, neural_running: bool, trader_running: bool) -> None:
+        now = time.time()
+
+        # Neural runner heartbeat from runner_ready.json
+        if neural_running:
+            ts = self._read_json_timestamp(self.runner_ready_path)
+            if ts is not None:
+                age = now - float(ts)
+                if age >= float(self._watchdog_runner_stale_sec):
+                    self._watchdog_restart_process(
+                        key="neural",
+                        proc=self.proc_neural,
+                        start_fn=self.start_neural,
+                        reason=f"runner_ready stale for {age:.1f}s (threshold {self._watchdog_runner_stale_sec:.1f}s)",
+                    )
+
+        # Trader heartbeat from trader_status.json
+        if trader_running:
+            ts = self._read_json_timestamp(self.trader_status_path)
+            if ts is not None:
+                age = now - float(ts)
+                if age >= float(self._watchdog_trader_stale_sec):
+                    self._watchdog_restart_process(
+                        key="trader",
+                        proc=self.proc_trader,
+                        start_fn=self.start_trader,
+                        reason=f"trader_status stale for {age:.1f}s (threshold {self._watchdog_trader_stale_sec:.1f}s)",
+                    )
+
     def _poll_runner_ready_then_start_trader(self) -> None:
         # Cancelled or already started
         if not bool(getattr(self, "_auto_start_trader_pending", False)):
@@ -3497,6 +3572,12 @@ class PowerTraderHub(tk.Tk):
         # process labels
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
         trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
+
+        # V1 watchdog: conservative stale-file restart checks
+        try:
+            self._watchdog_health_check(neural_running=neural_running, trader_running=trader_running)
+        except Exception:
+            pass
 
         self.lbl_neural.config(text=f"Neural: {'running' if neural_running else 'stopped'}")
         self.lbl_trader.config(text=f"Trader: {'running' if trader_running else 'stopped'}")

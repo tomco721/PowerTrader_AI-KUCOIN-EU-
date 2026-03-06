@@ -4,6 +4,7 @@ import json
 import uuid
 import time
 import math
+import sys
 from typing import Any, Dict, Optional
 from decimal import Decimal, ROUND_DOWN
 import requests
@@ -24,11 +25,30 @@ TRADER_STATUS_PATH = os.path.join(HUB_DATA_DIR, "trader_status.json")
 TRADE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "trade_history.jsonl")
 PNL_LEDGER_PATH = os.path.join(HUB_DATA_DIR, "pnl_ledger.json")
 ACCOUNT_VALUE_HISTORY_PATH = os.path.join(HUB_DATA_DIR, "account_value_history.jsonl")
+TRADER_ERRORS_PATH = os.path.join(HUB_DATA_DIR, "trader_errors.jsonl")
 
 # Any position with USD value below this threshold is treated as "dust":
 # - ignored for trailing/DCA logic
 # - does not block starting a fresh trade in that symbol
 DUST_VALUE_USD = 1.0
+
+# Exit intent / trailing execution hardening:
+# When trailing PM triggers an exit, we keep a short-lived "intent" per coin
+# and will retry the sell a few times if the initial order fails due to
+# transient API issues, while still staying comfortably in profit.
+EXIT_INTENT_TTL_SEC = 180          # How long (seconds) an exit intent stays active
+EXIT_INTENT_MAX_RETRIES = 3        # Max additional retries after the initial attempt
+EXIT_INTENT_RETRY_BACKOFF_SEC = 15 # Min seconds between retries for the same coin
+EXIT_INTENT_MAX_DROP_BELOW_PM_PCT = 0.5  # Allow at most this much below base PM line on retry
+EXIT_FEE_BUFFER_PCT = 0.2          # Extra buffer over avg_cost_basis to cover fees/slippage on retry
+
+# Pending-order reconcile hardening:
+# - Never block startup forever on unresolved pending orders.
+# - Quarantine very old pending orders so one bad record cannot stall trading.
+PENDING_RECONCILE_STARTUP_MAX_SEC = 60
+PENDING_ORDER_STALE_SEC = 30 * 60
+SOFT_ERROR_WINDOW_SEC = 5 * 60
+SOFT_ERROR_ALERT_THRESHOLD = 10
 
 
 
@@ -351,7 +371,7 @@ if not API_KEY or not API_SECRET or not API_PASSPHRASE:
     raise SystemExit(1)
 
 class CryptoAPITrading:
-    def __init__(self):
+    def __init__(self, auto_reconcile: bool = True):
         # keep a copy of the folder map (same idea as trader.py)
         self.path_map = dict(base_paths)
 
@@ -359,6 +379,10 @@ class CryptoAPITrading:
         self.api_secret = API_SECRET
         self.api_passphrase = API_PASSPHRASE
         self.base_url = "https://api.kucoin.com"
+
+        # Lightweight soft-error tracking (for previously silent except blocks)
+        self._soft_error_buckets: Dict[str, list] = {}
+        self._soft_error_last_alert_ts = 0.0
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = list(DCA_LEVELS)  # Hard DCA triggers (percent PnL)
@@ -378,14 +402,20 @@ class CryptoAPITrading:
             float(self.pm_start_pct_with_dca),
         )
 
-
+        # Per-coin exit intents for trailing sells (signal/execution separation)
+        # Example shape:
+        # { "BTC": {"ts": float, "base_pm_line": float, "avg_cost_basis": float,
+        #           "attempts": int, "last_attempt_ts": float} }
+        self.exit_intents: Dict[str, dict] = {}
 
         self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
         self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
 
         # GUI hub persistence
         self._pnl_ledger = self._load_pnl_ledger()
-        self._reconcile_pending_orders()
+        if auto_reconcile:
+            self._reconcile_pending_orders()
+            self._reconcile_stale_pending_orders(dry_run=False)
 
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
@@ -424,6 +454,77 @@ class CryptoAPITrading:
         except Exception:
             pass
 
+    def _log_soft_error(self, where: str, err: Optional[Exception] = None, **ctx: Any) -> None:
+        """
+        Minimal structured logging for non-fatal exceptions.
+        Keeps rolling counters so repeated silent failures become visible.
+        """
+        now = time.time()
+        err_type = type(err).__name__ if err is not None else "UnknownError"
+        err_msg = str(err) if err is not None else ""
+        key = f"{where}|{err_type}"
+
+        bucket = self._soft_error_buckets.setdefault(key, [])
+        bucket.append(now)
+
+        cutoff = now - float(SOFT_ERROR_WINDOW_SEC)
+        for k in list(self._soft_error_buckets.keys()):
+            ts_list = [t for t in self._soft_error_buckets.get(k, []) if t >= cutoff]
+            if ts_list:
+                self._soft_error_buckets[k] = ts_list
+            else:
+                self._soft_error_buckets.pop(k, None)
+
+        safe_ctx = {}
+        for ck, cv in (ctx or {}).items():
+            if cv is None:
+                continue
+            safe_ctx[str(ck)] = str(cv)
+
+        print(
+            f"[TRADER][WARN] soft_error where={where} "
+            f"type={err_type} msg={err_msg} ctx={safe_ctx}"
+        )
+
+        key_count = len(self._soft_error_buckets.get(key, []))
+
+        # Persist soft errors for Hub/UI consumers (JSONL one-line events)
+        self._append_jsonl(
+            TRADER_ERRORS_PATH,
+            {
+                "ts": now,
+                "level": "WARN",
+                "where": where,
+                "error_type": err_type,
+                "error_message": err_msg,
+                "ctx": safe_ctx,
+                "count_in_window": int(key_count),
+                "window_sec": int(SOFT_ERROR_WINDOW_SEC),
+            },
+        )
+
+        if key_count >= int(SOFT_ERROR_ALERT_THRESHOLD):
+            if (now - float(self._soft_error_last_alert_ts or 0.0)) >= 30.0:
+                self._soft_error_last_alert_ts = now
+                print(
+                    f"[TRADER][ALERT] repeated_soft_errors key={key} "
+                    f"count_last_{SOFT_ERROR_WINDOW_SEC}s={key_count}"
+                )
+                self._append_jsonl(
+                    TRADER_ERRORS_PATH,
+                    {
+                        "ts": now,
+                        "level": "ALERT",
+                        "where": where,
+                        "error_type": err_type,
+                        "error_message": err_msg,
+                        "ctx": safe_ctx,
+                        "key": key,
+                        "count_in_window": int(key_count),
+                        "window_sec": int(SOFT_ERROR_WINDOW_SEC),
+                    },
+                )
+
     def _append_jsonl(self, path: str, obj: dict) -> None:
         try:
             # Ensure directory exists
@@ -446,22 +547,24 @@ class CryptoAPITrading:
                 data.setdefault("last_updated_ts", time.time())
                 data.setdefault("open_positions", {})   # { "BTC": {"usd_cost": float, "qty": float} }
                 data.setdefault("pending_orders", {})   # { "<order_id>": {...} }
+                data.setdefault("stale_pending", {})    # { "<order_id>": {..., "stale_reason": "..."} }
                 return data
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error("_load_pnl_ledger", e, path=PNL_LEDGER_PATH)
         return {
             "total_realized_profit_usd": 0.0,
             "last_updated_ts": time.time(),
             "open_positions": {},
             "pending_orders": {},
+            "stale_pending": {},
         }
 
     def _save_pnl_ledger(self) -> None:
         try:
             self._pnl_ledger["last_updated_ts"] = time.time()
             self._atomic_write_json(PNL_LEDGER_PATH, self._pnl_ledger)
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error("_save_pnl_ledger", e, path=PNL_LEDGER_PATH)
 
     def _trade_history_has_order_id(self, order_id: str) -> bool:
         try:
@@ -483,6 +586,216 @@ class CryptoAPITrading:
         except Exception:
             return False
         return False
+
+
+    def _is_order_terminal(self, order: dict) -> bool:
+        if not isinstance(order, dict):
+            return False
+        state = str(order.get("state") or order.get("status") or "").lower().strip()
+        if state in {"done", "filled", "canceled", "cancelled", "rejected", "failed", "error"}:
+            return True
+        return False
+
+    def _estimate_cash_delta_from_order(self, side: str, order: dict) -> Optional[float]:
+        """
+        Best-effort cash delta from the KuCoin order payload.
+        Used only for delayed recovery/backfill when current buying power is no longer usable.
+        """
+        if not isinstance(order, dict):
+            return None
+
+        deal_funds = None
+        for k in ("dealFunds", "deal_funds", "filled_funds"):
+            if k in order:
+                try:
+                    deal_funds = float(order.get(k) or 0.0)
+                    break
+                except Exception:
+                    continue
+
+        if deal_funds is None or deal_funds <= 0.0:
+            filled_qty, avg_price = self._extract_fill_from_order(order)
+            if filled_qty > 0.0 and avg_price is not None and avg_price > 0.0:
+                deal_funds = float(filled_qty) * float(avg_price)
+
+        if deal_funds is None or deal_funds <= 0.0:
+            return None
+
+        side_l = str(side or "").lower().strip()
+        if side_l == "buy":
+            return -float(deal_funds)
+        if side_l == "sell":
+            return float(deal_funds)
+        return None
+
+    def _remove_order_from_bucket(self, bucket_name: str, order_id: str) -> None:
+        try:
+            bucket = self._pnl_ledger.get(bucket_name, {})
+            if isinstance(bucket, dict):
+                bucket.pop(order_id, None)
+                self._save_pnl_ledger()
+        except Exception as e:
+            self._log_soft_error(
+                "_remove_order_from_bucket",
+                e,
+                bucket_name=bucket_name,
+                order_id=order_id,
+            )
+
+    def _reconcile_order_record(
+        self,
+        order_id: str,
+        info: dict,
+        bucket_name: str,
+        wait_for_terminal: bool,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "order_id": order_id,
+            "bucket": bucket_name,
+            "status": "unknown",
+        }
+
+        if not order_id or not isinstance(info, dict):
+            result["status"] = "invalid_entry"
+            if not dry_run:
+                self._remove_order_from_bucket(bucket_name, order_id)
+            return result
+
+        if self._trade_history_has_order_id(order_id):
+            result["status"] = "already_recorded"
+            if not dry_run:
+                self._remove_order_from_bucket(bucket_name, order_id)
+            return result
+
+        symbol = str(info.get("symbol", "") or "").strip()
+        side = str(info.get("side", "") or "").strip().lower()
+        result["symbol"] = symbol
+        result["side"] = side
+
+        if not symbol or side not in ("buy", "sell"):
+            result["status"] = "missing_symbol_or_side"
+            if not dry_run:
+                self._remove_order_from_bucket(bucket_name, order_id)
+            return result
+
+        order = self._wait_for_order_terminal(symbol, order_id) if wait_for_terminal else self._get_order_by_id(symbol, order_id)
+        if not isinstance(order, dict):
+            result["status"] = "lookup_failed"
+            return result
+
+        filled_qty, avg_price = self._extract_fill_from_order(order)
+        result["filled_qty"] = float(filled_qty or 0.0)
+        result["avg_price"] = float(avg_price) if avg_price is not None else None
+
+        if not self._is_order_terminal(order) and not self._is_order_filled(order):
+            result["status"] = "non_terminal"
+            return result
+
+        if not self._is_order_filled(order):
+            result["status"] = "terminal_not_filled"
+            if not dry_run:
+                self._remove_order_from_bucket(bucket_name, order_id)
+            return result
+
+        buying_power_before = info.get("buying_power_before", None)
+        try:
+            if buying_power_before is not None:
+                buying_power_before = float(buying_power_before)
+        except Exception:
+            buying_power_before = None
+
+        order_ts = None
+        try:
+            raw_created_at = order.get("created_at") or order.get("createdAt") or order.get("_raw", {}).get("createdAt")
+            if raw_created_at is not None:
+                order_ts = float(raw_created_at)
+                if order_ts > 1e12:
+                    order_ts = order_ts / 1000.0
+        except Exception:
+            order_ts = None
+
+        buying_power_delta = self._estimate_cash_delta_from_order(side, order)
+        buying_power_after = None
+        if buying_power_before is not None and buying_power_delta is not None:
+            try:
+                buying_power_after = float(buying_power_before) + float(buying_power_delta)
+            except Exception:
+                buying_power_after = None
+
+        if dry_run:
+            result["status"] = "would_record_filled"
+            result["buying_power_delta"] = float(buying_power_delta) if buying_power_delta is not None else None
+            return result
+
+        self._record_trade(
+            side=side,
+            symbol=symbol,
+            qty=float(filled_qty),
+            price=float(avg_price) if avg_price is not None else None,
+            avg_cost_basis=info.get("avg_cost_basis", None),
+            pnl_pct=info.get("pnl_pct", None),
+            tag=info.get("tag", None),
+            order_id=order_id,
+            fees_usd=None,
+            buying_power_before=buying_power_before,
+            buying_power_after=buying_power_after,
+            buying_power_delta=buying_power_delta,
+            ts_override=order_ts,
+        )
+
+        if self._trade_history_has_order_id(order_id):
+            self._remove_order_from_bucket(bucket_name, order_id)
+            result["status"] = "recorded_filled"
+        else:
+            result["status"] = "record_attempt_failed"
+
+        result["buying_power_delta"] = float(buying_power_delta) if buying_power_delta is not None else None
+        return result
+
+    def _reconcile_stale_pending_orders(self, dry_run: bool = False) -> Dict[str, int]:
+        """
+        Best-effort reconciliation for stale_pending orders using KuCoin order history as source of truth.
+        Safe to run repeatedly: it matches by order_id and removes entries only after they are
+        confirmed as already recorded, recorded now, or terminal-not-filled.
+        """
+        summary = {
+            "scanned": 0,
+            "already_recorded": 0,
+            "recorded_filled": 0,
+            "would_record_filled": 0,
+            "terminal_not_filled": 0,
+            "lookup_failed": 0,
+            "non_terminal": 0,
+            "invalid_entry": 0,
+            "missing_symbol_or_side": 0,
+            "record_attempt_failed": 0,
+        }
+
+        try:
+            bucket = self._pnl_ledger.get("stale_pending", {})
+            if not isinstance(bucket, dict) or not bucket:
+                print("[TRADER] No stale_pending orders to reconcile.")
+                return summary
+
+            for order_id, info in list(bucket.items()):
+                summary["scanned"] += 1
+                outcome = self._reconcile_order_record(
+                    order_id=order_id,
+                    info=info if isinstance(info, dict) else {},
+                    bucket_name="stale_pending",
+                    wait_for_terminal=False,
+                    dry_run=dry_run,
+                )
+                status = str(outcome.get("status", "unknown"))
+                if status in summary:
+                    summary[status] += 1
+                print(f"[TRADER][STALE-RECON] {order_id} {status} {json.dumps(outcome, default=str)}")
+        except Exception as e:
+            self._log_soft_error("_reconcile_stale_pending_orders", e)
+
+        print(f"[TRADER][STALE-RECON] summary={json.dumps(summary, default=str)}")
+        return summary
 
     def _get_buying_power(self) -> float:
         try:
@@ -674,6 +987,8 @@ class CryptoAPITrading:
             # Successfully got order - reset timeout counter
             consecutive_timeouts = 0
             st = str(o.get("state", "")).lower().strip()
+            if self._is_order_filled(o):
+                return o
             # KuCoin uses "done" for completed orders (filled or canceled)
             if st in terminal or st == "done":
                 return o
@@ -715,20 +1030,61 @@ class CryptoAPITrading:
             if not isinstance(pending, dict) or not pending:
                 return
 
+            startup_reconcile_begin = time.time()
+
             # Loop until everything pending is resolved (matches your design: bot waits here).
             while True:
+                # Safety: never block startup forever.
+                if (time.time() - startup_reconcile_begin) > float(PENDING_RECONCILE_STARTUP_MAX_SEC):
+                    try:
+                        remaining = len(self._pnl_ledger.get("pending_orders", {}) or {})
+                    except Exception:
+                        remaining = -1
+                    print(
+                        f"[TRADER] Pending reconcile startup limit reached "
+                        f"({PENDING_RECONCILE_STARTUP_MAX_SEC}s). Continuing startup with {remaining} pending order(s)."
+                    )
+                    break
+
                 pending = self._pnl_ledger.get("pending_orders", {})
                 if not isinstance(pending, dict) or not pending:
                     break
 
                 progressed = False
+                now_ts = time.time()
 
                 for order_id, info in list(pending.items()):
                     try:
+                        # Quarantine very old pending entries so one stale record
+                        # cannot block startup indefinitely.
+                        created_raw = info.get("created_ts", None) if isinstance(info, dict) else None
+                        created_ts = None
+                        try:
+                            created_ts = float(created_raw) if created_raw is not None else None
+                        except Exception:
+                            created_ts = None
+
+                        if created_ts is not None:
+                            age_sec = now_ts - created_ts
+                            if age_sec > float(PENDING_ORDER_STALE_SEC):
+                                self._pnl_ledger.setdefault("stale_pending", {})
+                                stale_entry = dict(info) if isinstance(info, dict) else {"raw": info}
+                                stale_entry["stale_reason"] = "pending_ttl_expired"
+                                stale_entry["stale_at_ts"] = now_ts
+                                stale_entry["stale_age_sec"] = float(age_sec)
+                                self._pnl_ledger["stale_pending"][order_id] = stale_entry
+                                self._pnl_ledger["pending_orders"].pop(order_id, None)
+                                self._save_pnl_ledger()
+                                print(
+                                    f"[TRADER] Moved stale pending order {order_id} to stale_pending "
+                                    f"(age={age_sec:.1f}s > {PENDING_ORDER_STALE_SEC}s)."
+                                )
+                                progressed = True
+                                continue
+
                         if self._trade_history_has_order_id(order_id):
                             # Already recorded (e.g., crash after writing history) -> just clear pending.
-                            self._pnl_ledger["pending_orders"].pop(order_id, None)
-                            self._save_pnl_ledger()
+                            self._remove_order_from_bucket("pending_orders", order_id)
                             progressed = True
                             continue
 
@@ -737,55 +1093,39 @@ class CryptoAPITrading:
                         bp_before = float(info.get("buying_power_before", 0.0) or 0.0)
 
                         if not symbol or not side or not order_id:
-                            self._pnl_ledger["pending_orders"].pop(order_id, None)
-                            self._save_pnl_ledger()
+                            self._remove_order_from_bucket("pending_orders", order_id)
                             progressed = True
                             continue
 
-                        order = self._wait_for_order_terminal(symbol, order_id)
-                        if not order:
-                            # Still no terminal state (timeout) -> leave pending for next reconcile pass
-                            continue
-
-                        if not self._is_order_filled(order):
-                            # Terminal but not filled (cancelled/rejected/...) -> clear pending, nothing to record.
-                            self._pnl_ledger["pending_orders"].pop(order_id, None)
-                            self._save_pnl_ledger()
-                            progressed = True
-                            continue
-
-                        filled_qty, avg_price = self._extract_fill_from_order(order)
-                        bp_after = self._get_buying_power()
-                        bp_delta = float(bp_after) - float(bp_before)
-
-                        self._record_trade(
-                            side=side,
-                            symbol=symbol,
-                            qty=float(filled_qty),
-                            price=float(avg_price) if avg_price is not None else None,
-                            avg_cost_basis=info.get("avg_cost_basis", None),
-                            pnl_pct=info.get("pnl_pct", None),
-                            tag=info.get("tag", None),
+                        outcome = self._reconcile_order_record(
                             order_id=order_id,
-                            fees_usd=None,
-                            buying_power_before=bp_before,
-                            buying_power_after=bp_after,
-                            buying_power_delta=bp_delta,
+                            info=info,
+                            bucket_name="pending_orders",
+                            wait_for_terminal=True,
+                            dry_run=False,
                         )
+                        if str(outcome.get("status")) in (
+                            "already_recorded",
+                            "recorded_filled",
+                            "terminal_not_filled",
+                            "invalid_entry",
+                            "missing_symbol_or_side",
+                        ):
+                            progressed = True
 
-                        # Clear pending now that we recorded it
-                        self._pnl_ledger["pending_orders"].pop(order_id, None)
-                        self._save_pnl_ledger()
-                        progressed = True
-
-                    except Exception:
+                    except Exception as e:
+                        self._log_soft_error(
+                            "_reconcile_pending_orders.loop_item",
+                            e,
+                            order_id=order_id,
+                        )
                         continue
 
                 if not progressed:
                     time.sleep(1)
 
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error("_reconcile_pending_orders.outer", e)
 
     def _record_trade(
         self,
@@ -801,6 +1141,7 @@ class CryptoAPITrading:
         buying_power_before: Optional[float] = None,
         buying_power_after: Optional[float] = None,
         buying_power_delta: Optional[float] = None,
+        ts_override: Optional[float] = None,
     ) -> None:
         """
         Minimal local ledger for GUI:
@@ -808,7 +1149,7 @@ class CryptoAPITrading:
         - update pnl_ledger.json on sells (now using buying power delta when available)
         - persist per-coin open position cost (USD) so realized profit is exact
         """
-        ts = time.time()
+        ts = float(ts_override) if ts_override is not None else time.time()
 
         side_l = str(side or "").lower().strip()
         base = str(symbol or "").upper().split("-")[0].strip()
@@ -820,8 +1161,12 @@ class CryptoAPITrading:
             self._pnl_ledger.setdefault("total_realized_profit_usd", 0.0)
             self._pnl_ledger.setdefault("open_positions", {})
             self._pnl_ledger.setdefault("pending_orders", {})
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error(
+                "_record_trade.ensure_ledger_keys",
+                e,
+                symbol=symbol,
+            )
 
         realized = None
         position_cost_used = None
@@ -2222,8 +2567,13 @@ class CryptoAPITrading:
                     try:
                         self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                         self._save_pnl_ledger()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._log_soft_error(
+                            "place_sell_order.clear_pending_not_filled",
+                            e,
+                            symbol=symbol,
+                            order_id=order_id,
+                        )
                     return response
 
                 execs = match.get("executions", []) or []
@@ -2256,8 +2606,13 @@ class CryptoAPITrading:
 
                 fees_usd = float(fee_total) if fee_total else 0.0
 
-        except Exception:
-            pass  # print(traceback.format_exc())
+        except Exception as e:
+            self._log_soft_error(
+                "place_sell_order.fetch_fills",
+                e,
+                symbol=symbol,
+                order_id=order_id,
+            )
 
         # If we managed to get a better fill price, update the displayed PnL% too
         if avg_cost_basis is not None and actual_price is not None:
@@ -2296,8 +2651,13 @@ class CryptoAPITrading:
             if order_id:
                 self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                 self._save_pnl_ledger()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error(
+                "place_sell_order.clear_pending",
+                e,
+                symbol=symbol,
+                order_id=order_id,
+            )
 
         return response
 
@@ -2336,8 +2696,8 @@ class CryptoAPITrading:
                 self.trailing_pm = {}
 
             self._last_trailing_settings_sig = new_sig
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error("manage_trades.refresh_settings", e)
 
 
 
@@ -2674,57 +3034,179 @@ class CryptoAPITrading:
                     if new_line > state["line"]:
                         state["line"] = new_line
 
-                    crossed_down = current_sell_price < state["line"]
+                    now_ts = time.time()
 
-                    if crossed_down:
-                        # Two možné scenáre:
-                        # 1) Normálny trailing hit: boli sme nad line a teraz sme pod ňou.
-                        # 2) Cena spadla "cez" trailing line bez toho, aby sme tick s Above=True zachytili,
-                        #    ale stále sme nad base_pm_line (stále v plánovanom profitzóne).
-                        if state["was_above"] or current_sell_price >= base_pm_line:
-                            print(
-                                f"  Trailing PM hit for {symbol}. "
-                                f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
-                            )
-                            response = self.place_sell_order(
-                                str(uuid.uuid4()),
-                                "sell",
-                                "market",
-                                full_symbol,
-                                quantity,
-                                expected_price=current_sell_price,
-                                avg_cost_basis=avg_cost_basis,
-                                pnl_pct=gain_loss_percentage_sell,
-                                tag="TRAIL_SELL",
-                            )
+                    # --- Handle any existing exit intent for this symbol (retry logic) ---
+                    intent = self.exit_intents.get(symbol)
+                    if intent:
+                        age = now_ts - float(intent.get("ts", now_ts))
+                        attempts = int(intent.get("attempts", 0))
+                        last_attempt_ts = float(intent.get("last_attempt_ts", 0.0))
 
-                            # Only treat this as a completed trade if place_sell_order
-                            # actually managed to record it (order filled and written
-                            # to trade_history/pnl_ledger).
-                            if (
-                                response
-                                and isinstance(response, dict)
-                                and response.get("recorded_trade")
-                            ):
-                                trades_made = True
-                                self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
-
-                                # Trade ended -> reset rolling 24h DCA window for this coin
-                                self._reset_dca_window_for_trade(symbol, sold=True)
-
-                                print(f"  Successfully sold {quantity} {symbol}.")
-                                time.sleep(5)
-                                holdings = self.get_holdings()
-                                continue
+                        if age > EXIT_INTENT_TTL_SEC:
+                            reason = "ttl_expired"
+                            print(f"[TRADER] Expiring exit intent for {symbol} ({reason}) after {age:.1f}s.")
+                            self.exit_intents.pop(symbol, None)
                         else:
-                            # Cena spadla nielen pod trailing line, ale aj pod pôvodný PM štart line.
-                            # To znamená, že prvý beh trailing stopu sme "prepásli" (napr. počas reštartu
-                            # alebo medzitickového gapu). V takom prípade trailing bezpečne resetneme
-                            # späť na base_pm_line, aby sa nemohol natrvalo zaseknúť na starej vysokej cene.
-                            state["active"] = False
-                            state["line"] = base_pm_line
-                            state["peak"] = 0.0
-                            state["was_above"] = False
+                            # Do not spam retries; respect backoff and max attempts.
+                            if attempts < EXIT_INTENT_MAX_RETRIES and (now_ts - last_attempt_ts) >= EXIT_INTENT_RETRY_BACKOFF_SEC:
+                                # Only retry while still comfortably above cost basis (with fee buffer)
+                                fee_buffer_multiplier = 1.0 + (EXIT_FEE_BUFFER_PCT / 100.0)
+                                min_price_for_profit = float(avg_cost_basis) * fee_buffer_multiplier
+
+                                # How far pod base_pm_line sme pri re-try.
+                                drop_pct = 0.0
+                                if base_pm_line > 0.0:
+                                    drop_pct = ((base_pm_line - current_sell_price) / base_pm_line) * 100.0
+
+                                within_drop_limit = drop_pct <= EXIT_INTENT_MAX_DROP_BELOW_PM_PCT
+                                still_profitable = current_sell_price >= min_price_for_profit
+
+                                # Neotváraj nový SELL, ak už na tento symbol visí pending SELL order.
+                                has_pending_sell = False
+                                try:
+                                    pending_orders = self._pnl_ledger.get("pending_orders", {}) or {}
+                                    for po in pending_orders.values():
+                                        if (
+                                            str(po.get("symbol", "")).strip().upper() == full_symbol
+                                            and str(po.get("side", "")).strip().lower() == "sell"
+                                        ):
+                                            has_pending_sell = True
+                                            break
+                                except Exception:
+                                    has_pending_sell = False
+
+                                if within_drop_limit and still_profitable and not has_pending_sell:
+                                    print(
+                                        f"[TRADER] Retrying trailing sell for {symbol} "
+                                        f"(attempt {attempts + 1}/{EXIT_INTENT_MAX_RETRIES}, "
+                                        f"drop={drop_pct:.3f}%, "
+                                        f"price={current_sell_price:.8f}, "
+                                        f"min_profit_price={min_price_for_profit:.8f})."
+                                    )
+                                    intent["attempts"] = attempts + 1
+                                    intent["last_attempt_ts"] = now_ts
+
+                                    response = self.place_sell_order(
+                                        str(uuid.uuid4()),
+                                        "sell",
+                                        "market",
+                                        full_symbol,
+                                        quantity,
+                                        expected_price=current_sell_price,
+                                        avg_cost_basis=avg_cost_basis,
+                                        pnl_pct=gain_loss_percentage_sell,
+                                        tag="TRAIL_SELL",
+                                    )
+
+                                    if (
+                                        response
+                                        and isinstance(response, dict)
+                                        and response.get("recorded_trade")
+                                    ):
+                                        trades_made = True
+                                        self.trailing_pm.pop(symbol, None)
+                                        self.exit_intents.pop(symbol, None)
+                                        self._reset_dca_window_for_trade(symbol, sold=True)
+                                        print(f"  Successfully sold {quantity} {symbol} (retry).")
+                                        time.sleep(5)
+                                        holdings = self.get_holdings()
+                                        continue
+                                else:
+                                    # Podmienky na retry už nesedia (príliš pod PM line alebo už nie sme nad cost basis).
+                                    if not within_drop_limit:
+                                        reason = f"drop_limit_exceeded ({drop_pct:.3f}%)"
+                                    elif not still_profitable:
+                                        reason = "below_cost_with_fees"
+                                    elif has_pending_sell:
+                                        reason = "pending_sell_exists"
+                                    else:
+                                        reason = "unknown_guard"
+                                    print(f"[TRADER] Giving up retrying exit for {symbol}: {reason}.")
+                                    self.exit_intents.pop(symbol, None)
+
+                    # If there is an active exit intent, do not trigger a brand new one in the same tick.
+                    intent = self.exit_intents.get(symbol)
+                    if not intent:
+                        crossed_down = current_sell_price < state["line"]
+
+                        if crossed_down:
+                            # Two možné scenáre:
+                            # 1) Normálny trailing hit: boli sme nad line a teraz sme pod ňou.
+                            # 2) Cena spadla "cez" trailing line bez toho, aby sme tick s Above=True zachytili,
+                            #    ale stále sme nad base_pm_line (stále v plánovanom profitzóne).
+                            if state["was_above"] or current_sell_price >= base_pm_line:
+                                print(
+                                    f"  Trailing PM hit for {symbol}. "
+                                    f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
+                                )
+
+                                # Register a fresh exit intent so we can safely retry if needed.
+                                self.exit_intents[symbol] = {
+                                    "ts": now_ts,
+                                    "base_pm_line": float(base_pm_line),
+                                    "avg_cost_basis": float(avg_cost_basis),
+                                    "attempts": 0,
+                                    "last_attempt_ts": 0.0,
+                                }
+
+                                # Neotváraj nový SELL, ak už na tento symbol visí pending SELL order.
+                                has_pending_sell = False
+                                try:
+                                    pending_orders = self._pnl_ledger.get("pending_orders", {}) or {}
+                                    for po in pending_orders.values():
+                                        if (
+                                            str(po.get("symbol", "")).strip().upper() == full_symbol
+                                            and str(po.get("side", "")).strip().lower() == "sell"
+                                        ):
+                                            has_pending_sell = True
+                                            break
+                                except Exception:
+                                    has_pending_sell = False
+
+                                if has_pending_sell:
+                                    print(f"[TRADER] Pending sell already exists for {symbol}; skipping new trailing sell order.")
+                                else:
+                                    response = self.place_sell_order(
+                                        str(uuid.uuid4()),
+                                        "sell",
+                                        "market",
+                                        full_symbol,
+                                        quantity,
+                                        expected_price=current_sell_price,
+                                        avg_cost_basis=avg_cost_basis,
+                                        pnl_pct=gain_loss_percentage_sell,
+                                        tag="TRAIL_SELL",
+                                    )
+
+                                    # Only treat this as a completed trade if place_sell_order
+                                    # actually managed to record it (order filled and written
+                                    # to trade_history/pnl_ledger).
+                                    if (
+                                        response
+                                        and isinstance(response, dict)
+                                        and response.get("recorded_trade")
+                                    ):
+                                        trades_made = True
+                                        self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                                        self.exit_intents.pop(symbol, None)
+
+                                        # Trade ended -> reset rolling 24h DCA window for this coin
+                                        self._reset_dca_window_for_trade(symbol, sold=True)
+
+                                        print(f"  Successfully sold {quantity} {symbol}.")
+                                        time.sleep(5)
+                                        holdings = self.get_holdings()
+                                        continue
+                            else:
+                                # Cena spadla nielen pod trailing line, ale aj pod pôvodný PM štart line.
+                                # To znamená, že prvý beh trailing stopu sme "prepásli" (napr. počas reštartu
+                                # alebo medzitickového gapu). V takom prípade trailing bezpečne resetneme
+                                # späť na base_pm_line, aby sa nemohol natrvalo zaseknúť na starej vysokej cene.
+                                state["active"] = False
+                                state["line"] = base_pm_line
+                                state["peak"] = 0.0
+                                state["was_above"] = False
 
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
@@ -2748,7 +3230,7 @@ class CryptoAPITrading:
             else:
                 current_stage = len(self.dca_levels_triggered.get(symbol, []))
 
-            # Hardcoded loss % for this stage (repeat last level after list ends)
+                # Hardcoded loss % for this stage (repeat last level after list ends)
                 hard_level = self.dca_levels[current_stage] if current_stage < len(self.dca_levels) else self.dca_levels[-1]
                 hard_hit = gain_loss_percentage_buy <= hard_level
 
@@ -2766,7 +3248,11 @@ class CryptoAPITrading:
                 # Keep it sane: don't DCA from neural if we're not even below cost basis.
                 neural_hit = (gain_loss_percentage_buy < 0) and (neural_level_now >= neural_level_needed)
 
-            if value >= DUST_VALUE_USD and (hard_hit or neural_hit):
+            # Ak máme aktívny exit intent pre tento coin, počas jeho TTL neotváraj nové DCA
+            # (aby sa BUY a SELL nerozhodovali v tom istom krátkom okne).
+            intent = self.exit_intents.get(symbol)
+
+            if value >= DUST_VALUE_USD and (hard_hit or neural_hit) and not intent:
                 if neural_hit and hard_hit:
                     reason = f"NEURAL L{neural_level_now}>=L{neural_level_needed} OR HARD {hard_level:.2f}%"
                 elif neural_hit:
@@ -2865,8 +3351,8 @@ class CryptoAPITrading:
                     "trail_peak": 0.0,
                     "dist_to_trail_pct": 0.0,
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_soft_error("manage_trades.write_status", e)
 
         if not trading_pairs:
             return
@@ -3002,5 +3488,14 @@ class CryptoAPITrading:
                 print(traceback.format_exc())
 
 if __name__ == "__main__":
-    trading_bot = CryptoAPITrading()
-    trading_bot.run()
+    cli_args = [str(a).strip().lower() for a in sys.argv[1:]]
+
+    if "--audit-stale-orders" in cli_args:
+        trading_bot = CryptoAPITrading(auto_reconcile=False)
+        trading_bot._reconcile_stale_pending_orders(dry_run=True)
+    elif "--repair-stale-orders" in cli_args:
+        trading_bot = CryptoAPITrading(auto_reconcile=False)
+        trading_bot._reconcile_stale_pending_orders(dry_run=False)
+    else:
+        trading_bot = CryptoAPITrading()
+        trading_bot.run()
