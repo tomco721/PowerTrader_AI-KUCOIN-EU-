@@ -15,6 +15,8 @@ import traceback
 import hmac
 import hashlib
 
+from pt_notify import send_telegram_message
+
 # -----------------------------
 # GUI HUB OUTPUTS
 # -----------------------------
@@ -78,6 +80,12 @@ _gui_settings_cache = {
 	"pm_start_pct_no_dca": 5.0,
 	"pm_start_pct_with_dca": 2.5,
 	"trailing_gap_pct": 0.5,
+	"telegram_enabled": False,
+	"telegram_bot_token": "",
+	"telegram_chat_id": "",
+	"telegram_notify_buys": True,
+	"telegram_notify_dca": True,
+	"telegram_notify_sells": True,
 }
 
 
@@ -188,6 +196,12 @@ def _load_gui_settings() -> dict:
 		if trailing_gap_pct < 0.0:
 			trailing_gap_pct = 0.0
 
+		telegram_enabled = bool(data.get("telegram_enabled", _gui_settings_cache.get("telegram_enabled", False)))
+		telegram_bot_token = str(data.get("telegram_bot_token", _gui_settings_cache.get("telegram_bot_token", "")) or "").strip()
+		telegram_chat_id = str(data.get("telegram_chat_id", _gui_settings_cache.get("telegram_chat_id", "")) or "").strip()
+		telegram_notify_buys = bool(data.get("telegram_notify_buys", _gui_settings_cache.get("telegram_notify_buys", True)))
+		telegram_notify_dca = bool(data.get("telegram_notify_dca", _gui_settings_cache.get("telegram_notify_dca", True)))
+		telegram_notify_sells = bool(data.get("telegram_notify_sells", _gui_settings_cache.get("telegram_notify_sells", True)))
 
 		_gui_settings_cache["mtime"] = mtime
 		_gui_settings_cache["coins"] = coins
@@ -201,6 +215,12 @@ def _load_gui_settings() -> dict:
 		_gui_settings_cache["pm_start_pct_no_dca"] = pm_start_pct_no_dca
 		_gui_settings_cache["pm_start_pct_with_dca"] = pm_start_pct_with_dca
 		_gui_settings_cache["trailing_gap_pct"] = trailing_gap_pct
+		_gui_settings_cache["telegram_enabled"] = telegram_enabled
+		_gui_settings_cache["telegram_bot_token"] = telegram_bot_token
+		_gui_settings_cache["telegram_chat_id"] = telegram_chat_id
+		_gui_settings_cache["telegram_notify_buys"] = telegram_notify_buys
+		_gui_settings_cache["telegram_notify_dca"] = telegram_notify_dca
+		_gui_settings_cache["telegram_notify_sells"] = telegram_notify_sells
 
 
 		return {
@@ -216,6 +236,12 @@ def _load_gui_settings() -> dict:
 			"pm_start_pct_no_dca": pm_start_pct_no_dca,
 			"pm_start_pct_with_dca": pm_start_pct_with_dca,
 			"trailing_gap_pct": trailing_gap_pct,
+			"telegram_enabled": telegram_enabled,
+			"telegram_bot_token": telegram_bot_token,
+			"telegram_chat_id": telegram_chat_id,
+			"telegram_notify_buys": telegram_notify_buys,
+			"telegram_notify_dca": telegram_notify_dca,
+			"telegram_notify_sells": telegram_notify_sells,
 		}
 
 
@@ -1130,6 +1156,114 @@ class CryptoAPITrading:
         except Exception as e:
             self._log_soft_error("_reconcile_pending_orders.outer", e)
 
+    def _telegram_trade_notifications_enabled(self, side: str, tag: Optional[str]) -> bool:
+        settings = _load_gui_settings()
+        if not bool(settings.get("telegram_enabled", False)):
+            return False
+
+        side_l = str(side or "").lower().strip()
+        tag_u = str(tag or "").upper().strip()
+        if side_l == "sell":
+            return bool(settings.get("telegram_notify_sells", True))
+        if side_l == "buy" and tag_u == "DCA":
+            return bool(settings.get("telegram_notify_dca", True))
+        if side_l == "buy":
+            return bool(settings.get("telegram_notify_buys", True))
+        return False
+
+    def _format_open_trades_for_notification(self) -> str:
+        try:
+            open_pos = self._pnl_ledger.get("open_positions", {})
+            if not isinstance(open_pos, dict):
+                return "None"
+            coins = []
+            for coin, pos in open_pos.items():
+                if not isinstance(pos, dict):
+                    continue
+                qty = float(pos.get("qty", 0.0) or 0.0)
+                if qty > 1e-12:
+                    coins.append(str(coin).upper().strip())
+            coins = sorted(set(c for c in coins if c))
+            if not coins:
+                return "None"
+            if len(coins) <= 6:
+                return ", ".join(coins)
+            return ", ".join(coins[:6]) + f" (+{len(coins) - 6} more)"
+        except Exception:
+            return "Unknown"
+
+    def _send_trade_notification(
+        self,
+        side: str,
+        symbol: str,
+        qty: float,
+        price: Optional[float],
+        tag: Optional[str] = None,
+        realized: Optional[float] = None,
+        buying_power_after: Optional[float] = None,
+    ) -> None:
+        if not self._telegram_trade_notifications_enabled(side=side, tag=tag):
+            return
+
+        settings = _load_gui_settings()
+        bot_token = str(settings.get("telegram_bot_token", "") or "").strip()
+        chat_id = str(settings.get("telegram_chat_id", "") or "").strip()
+        if not bot_token or not chat_id:
+            return
+
+        side_l = str(side or "").lower().strip()
+        tag_u = str(tag or "").upper().strip()
+        if side_l == "buy" and tag_u == "DCA":
+            action = "DCA BUY"
+        elif side_l == "buy":
+            action = "BUY"
+        elif side_l == "sell":
+            action = "SELL"
+        else:
+            action = str(side or "TRADE").upper().strip() or "TRADE"
+
+        snapshot = getattr(self, "_last_good_account_snapshot", {}) or {}
+        total_account_value = snapshot.get("total_account_value", None)
+        buying_power_value = buying_power_after if buying_power_after is not None else snapshot.get("buying_power", None)
+
+        lines = [f"{action} {symbol}"]
+        try:
+            q = float(qty or 0.0)
+            lines.append(f"qty: {q:.8f}".rstrip("0").rstrip("."))
+        except Exception:
+            lines.append(f"qty: {qty}")
+
+        if price is not None:
+            try:
+                lines.append(f"price: {self._fmt_price(float(price))}")
+            except Exception:
+                lines.append(f"price: {price}")
+
+        if realized is not None and side_l == "sell":
+            try:
+                lines.append(f"realized pnl: {float(realized):+.2f} USD")
+            except Exception:
+                lines.append(f"realized pnl: {realized}")
+
+        if buying_power_value is not None:
+            try:
+                lines.append(f"buying power: {float(buying_power_value):.2f} USDT")
+            except Exception:
+                pass
+
+        if total_account_value is not None:
+            try:
+                lines.append(f"account value: {float(total_account_value):.2f} USDT")
+            except Exception:
+                pass
+
+        lines.append(f"open trades: {self._format_open_trades_for_notification()}")
+
+        try:
+            send_telegram_message(bot_token=bot_token, chat_id=chat_id, text="\n".join(lines), timeout=4.0)
+        except Exception:
+            pass
+
     def _record_trade(
         self,
         side: str,
@@ -1283,7 +1417,15 @@ class CryptoAPITrading:
         }
         self._append_jsonl(TRADE_HISTORY_PATH, entry)
 
-
+        self._send_trade_notification(
+            side=side,
+            symbol=symbol,
+            qty=qty,
+            price=price,
+            tag=tag,
+            realized=realized,
+            buying_power_after=buying_power_after,
+        )
 
 
     def _write_trader_status(self, status: dict) -> None:

@@ -21,6 +21,7 @@ Main fork differences:
 - Very old unresolved pending orders are quarantined into `stale_pending` instead of blocking startup forever.
 - `stale_pending` orders can be audited and repaired later from KuCoin order history using the order id as the source of truth.
 - Trade history and realized/open-position accounting are written locally for GUI display and restart recovery.
+- Telegram trade notifications can be configured from the Hub for confirmed BUY, DCA BUY, and SELL events.
 - Dust positions are ignored for fresh-entry blocking and for most DCA/trailing decisions.
 - Trailing exits have a short-lived retry intent so a temporary API hiccup does not immediately waste a profitable exit.
 
@@ -127,6 +128,7 @@ Open `Settings` in the Hub and set:
 - Start allocation %
 - DCA multiplier / DCA levels / max DCA buys per 24h
 - Trailing PM values
+- Optional Telegram notification settings
 
 In the KuCoin API section:
 1. Open the Setup Wizard.
@@ -141,14 +143,46 @@ This creates:
 
 Keep these files private.
 
-### 6. Train
+### 6. Optional Telegram Notifications
+The Hub can configure Telegram notifications for confirmed trades.
+Current V1 scope:
+
+- BUY
+- DCA BUY
+- SELL
+
+Setup flow:
+1. Create a Telegram bot with `@BotFather`.
+2. Send a message to your bot from your Telegram account.
+3. In Hub `Settings`, enable Telegram notifications.
+4. Fill in:
+   - Telegram bot token
+   - Telegram chat ID
+5. Use `Send Test Message` before saving if you want to verify the setup immediately.
+
+Message contents in V1:
+- action
+- symbol
+- quantity
+- fill price
+- realized PnL on SELL
+- buying power
+- total account value
+- brief list of open trades
+
+Safety rules in this fork:
+- notifications are sent only after the trade is confirmed and written to local history
+- Telegram failures must not interrupt trading
+- if Telegram is disabled or not configured, the trader silently skips notifications
+
+### 7. Train
 In the Hub:
 1. Click `Train All`.
 2. Wait for training to finish.
 
 The Hub uses training freshness, not only file existence. If a coin is stale or missing its training timestamp, it stays not-ready until retrained.
 
-### 7. Start The System
+### 8. Start The System
 In the Hub:
 1. Click `Start All`.
 

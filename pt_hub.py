@@ -21,6 +21,8 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import blended_transform_factory
 
+from pt_notify import send_telegram_message
+
 DARK_BG = "#070B10"
 DARK_BG2 = "#0B1220"
 DARK_PANEL = "#0E1626"
@@ -316,6 +318,14 @@ DEFAULT_SETTINGS = {
     "pm_start_pct_no_dca": 5.0,
     "pm_start_pct_with_dca": 2.5,
     "trailing_gap_pct": 0.5,
+
+    # --- Telegram notifications (optional; used by pt_trader.py) ---
+    "telegram_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "telegram_notify_buys": True,
+    "telegram_notify_dca": True,
+    "telegram_notify_sells": True,
 
     "default_timeframe": "1hour",
     "timeframes": [
@@ -4580,7 +4590,12 @@ class PowerTraderHub(tk.Tk):
 
         hub_dir_var = tk.StringVar(value=self.settings.get("hub_data_dir", ""))
 
-
+        telegram_enabled_var = tk.BooleanVar(value=bool(self.settings.get("telegram_enabled", False)))
+        telegram_bot_token_var = tk.StringVar(value=str(self.settings.get("telegram_bot_token", "") or ""))
+        telegram_chat_id_var = tk.StringVar(value=str(self.settings.get("telegram_chat_id", "") or ""))
+        telegram_notify_buys_var = tk.BooleanVar(value=bool(self.settings.get("telegram_notify_buys", True)))
+        telegram_notify_dca_var = tk.BooleanVar(value=bool(self.settings.get("telegram_notify_dca", True)))
+        telegram_notify_sells_var = tk.BooleanVar(value=bool(self.settings.get("telegram_notify_sells", True)))
 
         neural_script_var = tk.StringVar(value=self.settings["script_neural_runner2"])
         trainer_script_var = tk.StringVar(value=self.settings.get("script_neural_trainer", "pt_trainer.py"))
@@ -4652,8 +4667,81 @@ class PowerTraderHub(tk.Tk):
 
         add_row(r, "Hub data dir (optional):", hub_dir_var, browse="dir"); r += 1
 
+        ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
+        def _send_telegram_test_message() -> None:
+            token = telegram_bot_token_var.get().strip()
+            chat_id = telegram_chat_id_var.get().strip()
+            if not token or not chat_id:
+                messagebox.showerror("Telegram test", "Please fill in Telegram bot token and chat ID first.")
+                return
 
+            try:
+                total_val = float(getattr(self, "_last_total_account_value", 0.0) or 0.0)
+            except Exception:
+                total_val = 0.0
+
+            open_trades = []
+            try:
+                positions = getattr(self, "_last_positions", {}) or {}
+                if isinstance(positions, dict):
+                    for coin, pos in positions.items():
+                        try:
+                            qty = float((pos or {}).get("quantity", 0.0) or 0.0)
+                        except Exception:
+                            qty = 0.0
+                        if qty > 0.0:
+                            open_trades.append(str(coin).upper().strip())
+            except Exception:
+                pass
+
+            open_trades = sorted(set(c for c in open_trades if c))
+            open_trades_txt = ", ".join(open_trades) if open_trades else "None"
+
+            lines = [
+                "PowerTrader Telegram test",
+                f"time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            ]
+            if total_val > 0.0:
+                lines.append(f"account value: {_fmt_money(total_val)}")
+            lines.append(f"open trades: {open_trades_txt}")
+
+            ok = send_telegram_message(
+                bot_token=token,
+                chat_id=chat_id,
+                text="\n".join(lines),
+                timeout=4.0,
+            )
+            if ok:
+                messagebox.showinfo("Telegram test", "Test message sent successfully.")
+            else:
+                messagebox.showerror("Telegram test", "Telegram test message failed. Check token, chat ID, and bot chat access.")
+
+        ttk.Label(frm, text="Telegram notifications:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        telegram_enabled_chk = ttk.Checkbutton(frm, text="Enable Telegram trade notifications", variable=telegram_enabled_var)
+        telegram_enabled_chk.grid(row=r, column=1, columnspan=2, sticky="w", pady=6)
+        r += 1
+
+        ttk.Label(frm, text="Telegram bot token:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        ttk.Entry(frm, textvariable=telegram_bot_token_var, show="*").grid(row=r, column=1, sticky="ew", pady=6)
+        ttk.Label(frm, text="").grid(row=r, column=2, sticky="e", padx=(10, 0), pady=6)
+        r += 1
+
+        add_row(r, "Telegram chat ID:", telegram_chat_id_var); r += 1
+
+        telegram_flags = ttk.Frame(frm)
+        telegram_flags.grid(row=r, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Checkbutton(telegram_flags, text="BUY", variable=telegram_notify_buys_var).pack(side="left")
+        ttk.Checkbutton(telegram_flags, text="DCA", variable=telegram_notify_dca_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(telegram_flags, text="SELL", variable=telegram_notify_sells_var).pack(side="left", padx=(12, 0))
+        ttk.Label(frm, text="Telegram events:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        r += 1
+
+        ttk.Label(frm, text="Telegram test:").grid(row=r, column=0, sticky="w", padx=(0, 10), pady=6)
+        telegram_test_row = ttk.Frame(frm)
+        telegram_test_row.grid(row=r, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Button(telegram_test_row, text="Send Test Message", command=_send_telegram_test_message).pack(side="left")
+        r += 1
 
         ttk.Separator(frm, orient="horizontal").grid(row=r, column=0, columnspan=3, sticky="ew", pady=10); r += 1
 
@@ -4937,8 +5025,12 @@ class PowerTraderHub(tk.Tk):
 
                 self.settings["hub_data_dir"] = hub_dir_var.get().strip()
 
-
-
+                self.settings["telegram_enabled"] = bool(telegram_enabled_var.get())
+                self.settings["telegram_bot_token"] = telegram_bot_token_var.get().strip()
+                self.settings["telegram_chat_id"] = telegram_chat_id_var.get().strip()
+                self.settings["telegram_notify_buys"] = bool(telegram_notify_buys_var.get())
+                self.settings["telegram_notify_dca"] = bool(telegram_notify_dca_var.get())
+                self.settings["telegram_notify_sells"] = bool(telegram_notify_sells_var.get())
 
                 self.settings["script_neural_runner2"] = neural_script_var.get().strip()
                 self.settings["script_neural_trainer"] = trainer_script_var.get().strip()
