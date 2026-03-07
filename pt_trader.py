@@ -45,6 +45,7 @@ EXIT_FEE_BUFFER_PCT = 0.2          # Extra buffer over avg_cost_basis to cover f
 # Pending-order reconcile hardening:
 # - Never block startup forever on unresolved pending orders.
 # - Quarantine very old pending orders so one bad record cannot stall trading.
+# - Keep enough local state to reconcile missing trade-history rows after restarts.
 PENDING_RECONCILE_STARTUP_MAX_SEC = 60
 PENDING_ORDER_STALE_SEC = 30 * 60
 SOFT_ERROR_WINDOW_SEC = 5 * 60
@@ -411,9 +412,10 @@ class CryptoAPITrading:
         self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
         self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
 
-        # GUI hub persistence
+        # GUI/runtime persistence used for restart recovery and Hub display.
         self._pnl_ledger = self._load_pnl_ledger()
         if auto_reconcile:
+            # First reconcile normal pending orders, then try delayed recovery for stale ones.
             self._reconcile_pending_orders()
             self._reconcile_stale_pending_orders(dry_run=False)
 
@@ -756,8 +758,9 @@ class CryptoAPITrading:
     def _reconcile_stale_pending_orders(self, dry_run: bool = False) -> Dict[str, int]:
         """
         Best-effort reconciliation for stale_pending orders using KuCoin order history as source of truth.
-        Safe to run repeatedly: it matches by order_id and removes entries only after they are
+        Safe to run repeatedly: it matches by order_id and only removes entries after they are
         confirmed as already recorded, recorded now, or terminal-not-filled.
+        This is also the logic behind the --audit-stale-orders / --repair-stale-orders CLI modes.
         """
         summary = {
             "scanned": 0,
@@ -808,8 +811,8 @@ class CryptoAPITrading:
 
     def _get_order_by_id(self, symbol: str, order_id: str) -> Optional[dict]:
         """
-        Fetch a single order from KuCoin and normalize fields, but keep raw
-        dealFunds/dealSize so cost basis and PnL can use the exact fill price.
+        Fetch a single order from KuCoin and normalize the fields the trader/reconcile code cares about.
+        We keep raw dealFunds/dealSize so cost basis, history backfill, and PnL logic can use the exact fill data.
         """
         try:
             path = f"/api/v1/orders/{order_id}"
@@ -1022,8 +1025,8 @@ class CryptoAPITrading:
 
     def _reconcile_pending_orders(self) -> None:
         """
-        If the hub/trader restarts mid-order, we keep the pre-order buying_power on disk and
-        finish the accounting once the order shows as terminal in Robinhood.
+        If the hub/trader restarts mid-order, keep the pre-order buying power on disk and
+        finish local accounting once KuCoin shows the order as terminal / filled.
         """
         try:
             pending = self._pnl_ledger.get("pending_orders", {})
@@ -3491,9 +3494,11 @@ if __name__ == "__main__":
     cli_args = [str(a).strip().lower() for a in sys.argv[1:]]
 
     if "--audit-stale-orders" in cli_args:
+        # Dry-run audit: report what stale_pending recovery would do without writing anything.
         trading_bot = CryptoAPITrading(auto_reconcile=False)
         trading_bot._reconcile_stale_pending_orders(dry_run=True)
     elif "--repair-stale-orders" in cli_args:
+        # Live repair: backfill confirmed missing trades from stale_pending into local history/ledger.
         trading_bot = CryptoAPITrading(auto_reconcile=False)
         trading_bot._reconcile_stale_pending_orders(dry_run=False)
     else:

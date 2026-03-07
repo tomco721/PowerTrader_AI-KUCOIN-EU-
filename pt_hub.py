@@ -1577,15 +1577,15 @@ class PowerTraderHub(tk.Tk):
         self.pnl_ledger_path = os.path.join(self.hub_dir, "pnl_ledger.json")
         self.account_value_history_path = os.path.join(self.hub_dir, "account_value_history.jsonl")
 
-        # file written by pt_thinker.py (runner readiness gate used for Start All)
+        # File written by pt_thinker.py. Start All waits for this readiness gate before launching the trader.
         self.runner_ready_path = os.path.join(self.hub_dir, "runner_ready.json")
 
 
-        # internal: when Start All is pressed, we start the runner first and only start the trader once ready
+        # Internal Start All flow: start runner first, then auto-start trader only after runner readiness is confirmed.
         self._auto_start_trader_pending = False
 
-        # ---- V1 watchdog (minimal + conservative) ----
-        # Only acts on processes that are already running.
+        # Minimal file-heartbeat watchdog.
+        # It only acts on processes that are already running and watches hub_data timestamps for staleness.
         self._watchdog_runner_stale_sec = 30.0
         self._watchdog_trader_stale_sec = 30.0
         self._watchdog_restart_cooldown_sec = 60.0
@@ -2269,7 +2269,7 @@ class PowerTraderHub(tk.Tk):
         self.lbl_training_overview = ttk.Label(training_left, text="Training: N/A")
         self.lbl_training_overview.pack(anchor="w", padx=6, pady=(0, 2))
 
-        self.lbl_flow_hint = ttk.Label(training_left, text="Flow: Train → Start All")
+        self.lbl_flow_hint = ttk.Label(training_left, text="Flow: Train -> Start All")
         self.lbl_flow_hint.pack(anchor="w", padx=6, pady=(0, 6))
 
         self.training_list = tk.Listbox(
@@ -3183,10 +3183,10 @@ class PowerTraderHub(tk.Tk):
         self._watchdog_last_restart_ts[key] = now
         print(f"[HUB][WATCHDOG] restarting {key}: {reason}")
 
-        # graceful stop only; no hard-kill in V1
+        # Graceful stop only. The watchdog should not hard-kill a trader process in this fork.
         self._stop_process(proc)
 
-        # delayed start gives terminate() a chance to complete
+        # Delayed restart gives terminate() a chance to complete cleanly.
         def _start_if_stopped() -> None:
             try:
                 if not (proc.proc and proc.proc.poll() is None):
@@ -3573,7 +3573,7 @@ class PowerTraderHub(tk.Tk):
         neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
         trader_running = bool(self.proc_trader.proc and self.proc_trader.proc.poll() is None)
 
-        # V1 watchdog: conservative stale-file restart checks
+        # Conservative heartbeat watchdog: restart only when the process is running but its hub_data heartbeat goes stale.
         try:
             self._watchdog_health_check(neural_running=neural_running, trader_running=trader_running)
         except Exception:

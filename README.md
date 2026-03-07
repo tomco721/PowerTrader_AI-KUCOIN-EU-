@@ -1,267 +1,186 @@
 # PowerTrader_AI
-Fully automated crypto trading powered by a custom price prediction AI and a structured/tiered DCA system.
-
-## About this KuCoin fork
-
-This repository is a **fork** of the original PowerTrader_AI, which was written for **Robinhood Crypto**.  
-This fork keeps the **AI, DCA logic and trailing-profit strategy** the same, but completely rewires the
-trading layer to work with **KuCoin spot (USDT) – suitable for EU users and non‑US residents.**
-
-High‑level changes in this fork:
-
-- **Exchange migration**: All live trading calls in `pt_trader.py` now use KuCoin REST API  
-  (`/api/v1/accounts`, `/api/v1/orders`, `/api/v1/symbols`, etc.) with HMAC‑SHA256 signing and KuCoin
-  API key + secret + passphrase (no more Robinhood keys, no NaCl/Ed25519 signing).
-- **Holdings & buying power**: Account balance and open positions are derived from KuCoin **trade accounts**
-  (USDT quote), and normalized back into the original “holdings/buying_power” structure used by the GUI.
-- **Order mapping layer**: KuCoin order responses (e.g. `dealFunds`, `dealSize`, `status`) are converted into
-  a Robinhood‑like format so the rest of the trader logic can stay almost unchanged.
-- **Cost basis fix**: Cost basis is now computed from **all filled BUY orders (including all DCA levels)**:
-  - full pagination over all `status=done` orders per symbol, and  
-  - a fallback to `trade_history.jsonl` to recover prices if the API omits fill details.  
-  This ensures sells only happen when there is **real profit versus the entire position**, not just the last DCA.
-- **Safety and robustness**: The trader caches last good bid/ask and account snapshots so transient KuCoin
-  API glitches do not create fake dips in the GUI or zero out account value.
-- **Settings integration**: The existing GUI **Settings** panel is reused; the “KuCoin API configured” section
-  loads keys from disk and hot‑reloads DCA / PM parameters exactly like in the original bot.
-- **Startup readiness gating**: `pt_hub.py` now waits for `pt_thinker.py` to report real prediction readiness
-  before starting `pt_trader.py`, which helps avoid starting the trader on placeholder / warming-up signals.
-- **Training freshness guard**: Coins are treated as not ready if their training stamp is missing or stale,
-  so the runner and hub stay aligned about whether a coin is actually trained.
-- **Order-state hardening**: Startup no longer waits forever on broken pending orders; old unresolved orders
-  are quarantined to a stale bucket so one bad record cannot stall the whole bot.
-- **Trailing-exit retry logic**: If a profitable trailing sell fails because of a transient API issue, the
-  trader keeps a short-lived exit intent and can retry the exit while the trade is still comfortably profitable.
-- **Dust handling**: Tiny leftover positions are treated as dust so they do not block fresh entries or distort
-  DCA / trailing behavior.
-
-Important: Many sections below in this README still mention **Robinhood** and the original key setup flow.  
-For this fork, treat those Robinhood‑specific parts as historical – live trading is performed **only against
-KuCoin** once you provide KuCoin API credentials in the Hub settings.
-
-DO NOT TRUST THE POWERTRADER FORK FROM Drizztdowhateva!!!
-
-This is my personal trading bot that I decided to make open source. I made this strategy to match my personal goals. This system is meant to be a foundation/framework for you to build your dream bot!
-
-I know there are "commonly essential" trading features that are missing (like no stop loss for example). This is by design because many of those things would just not work with this system's strategy as it stands, for my personal reasons below:
-
-I do not believe in selling worthwhile coins at a loss (and why would you trade anything besides worthwhile coins with a trading bot, anyways???).
-
-I DO believe in crypto. I'd rather just wait and maybe add more money to my account if need be so that the bot can buy even more of the coin while the price is down.
-
-I personally feel like many of those common things people use, like stop loss, are actually a trick or something, and I personally have absolutely no problem adding more money to my account to afford more DCA or having to wait for extended periods of time, if need be. In my opinion, anything else is just greedy and desperate, which is the exact OPPOSITE of needed attributes for long term growth. Plus, this is just spot trading... there's no worry of liquidation and it feels to me like many "risk management" tactics are really only meant for futures trading but people blindly apply them to spot trading when it just plain isn't necessary.
-
-I know the AI and the trading strategy are extremely simple because I'm the one that designed and made them. I've been developing this specific trading strategy for almost a decade and the design of the AI system for the last few years. The overall strategy is based on what ACTUALLY works from real trading experience, not just stuff I read in LLM responses or search engine results.
-
-
-Ok now that all of that is out of the way...
-
-I am not selling anything. This trading bot is not a product. This system is for experimentation and education. The only reason you would EVER send me money is if you are voluntarily donating (donation routes can be found at the bottom of this readme :) ). Do not fall for any scams! PowerTrader AI is COMPLETELY FREE FOREVER!
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
-
-“It’s an instance-based (kNN/kernel-style) predictor with online per-instance reliability weighting, used as a multi-timeframe trading signal.” - ChatGPT on the type of AI used in this trading bot.
-
-So what exactly does that mean?
-
-When people think AI, they usually think about LLM style AIs and neural networks. What many people don't realize is there are many types of Artificial Intelligence and Machine Learning - and the one in my trading system falls under the "Other" category.
-
-When training for a coin, it goes through the entire history for that coin on multiple timeframes and saves each pattern it sees, along with what happens on the next candle AFTER the pattern. It uses these saved patterns to generate a predicted candle by taking a weighted average of the closest matches in memory to the current pattern in time. This weighted average output is done once for each timeframe, from 1 hour up to 1 week. Each timeframe gets its own predicted candle. The low and high prices from these candles are what are shown as the blue and orange horizontal lines on the price charts. 
-
-After a candle closes, it checks what happened against what it predicted, and adjusts the weight for each "memory pattern" that was used to generate the weighted average, depending on how accurate each pattern was compared to what actually happened.
-
-Yes, it is EXTREMELY simple. Yes, it is STILL considered AI.
-
-Here is how the trading bot utilizes the price prediction ai to automatically make trades:
-
-For determining when to start trades, the AI's Thinker script sends a signal to start a trade for a coin if the ask price for the coin drops below at least 3 of the the AI's predicted low prices for the coin (it predicts the currently active candle's high and low prices for each timeframe across all timeframes from 1hr to 1wk).
-
-For determining when to DCA, it uses either the current price level from the AI that is tied to the current amount of DCA buys that have been done on the trade (for example, right after a trade starts when 3 blue lines get crossed, its first DCA wont happen until the price crosses the 4th line, so on so forth), or it uses the hardcoded drawdown % for its current level, whichever it hits first. It only allows a max of 2 DCAs within a rolling 24hr window to keep from dumping all of your money in too quickly on coins that are having an extended downtrend. Other risk management features can easily be added, as well, with just a bit of Python code!
-
-For determining when to sell, the bot uses a trailing profit margin to maximize the potential gains. The margin line is set at either 5% gain if no DCA has happened on the trade, or 2.5% gain if any DCA has happened. The trailing margin gap is 0.5% (this is the amount the price has to go over the profit margin to begin raising the profit margin up to TRAIL after the price and maximize how much profit is gained once the price drops below the profit margin again and the bot sells the trade.
-
-In this fork, those trade-management values are no longer purely hardcoded. The Hub settings can control:
-
-- **Trade start level** (default `3`)
-- **Start allocation %** for the initial entry
-- **DCA multiplier**
-- **DCA levels**
-- **Max DCA buys per 24h**
-- **Trailing PM start %** for no-DCA and with-DCA trades
-- **Trailing gap %**
-
-These values are hot-reloaded by the trader while the system is running, so you can tune them from the Hub without manually editing the scripts.
-
-
-# Setup & First-Time Use (Windows)
-
-THESE INSTRUCTIONS WERE WRITTEN BY AI! PLEASE LET ME KNOW IF THERE ARE ANY ERRORS OR ISSUES WITH THIS SETUP PROCESS!
-
-If you already have open spot positions on the **same KuCoin account** (for coins you plan to let the bot trade), be aware that PowerTrader will treat those holdings as part of its managed positions.  
-For the cleanest behavior, many users prefer to start with a **fresh KuCoin trade account / zero balances** on the coins managed by the bot, or at least understand that the bot will DCA and sell based on the *entire* quantity it sees for those coins on KuCoin.
-
-This page walks you through installing PowerTrader AI from start to finish, in the exact order a first-time user should do it.  
-No coding knowledge needed.  
-These instructions are Windows-based but PowerTrader AI *should* be able to run on any OS.
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
-
----
-
-## Step 1 — Install Python
-
-1. Go to **python.org** and download Python for Windows.
-2. Run the installer.
-3. **Check the box** that says: **“Add Python to PATH”**.
-4. Click **Install Now**.
-
----
-
-## Step 2 — Download PowerTrader AI
-
-1. Do not download the zip file of the repo! There is an issue I have to fix.
-2. Create a folder on your computer, like: `C:\PowerTraderAI\`
-3. On the PowerTrader_AI repo page, go to the code page for pt_hub.py, click the "Download Raw File" button, save it into the folder you just created.
-4. Repeat that for all files in the repo (except the readme and the license).
-
----
-
-## Step 3 — Install PowerTrader AI (one command)
-
-1. Open **Command Prompt** (Windows key → type **cmd** → Enter).
-2. Go into your PowerTrader AI folder. Example:
-
-   `cd C:\PowerTraderAI`
-
-3. If using Python 3.12 or higher, run this command:
-
-   `python -m pip install setuptools`
-
-4. Install everything PowerTrader AI needs:
-
-   `python -m pip install -r requirements.txt`
-
----
-
-## Step 4 — Start PowerTrader AI
-
-From the same Command Prompt window (inside your PowerTrader folder), run:
-
-`python pt_hub.py`
-
-The app that opens is the **PowerTrader Hub**.  
-This is the only thing you need to run day-to-day.
-
----
-
-## Step 5 — Set your folder, coins, and KuCoin API keys (inside the Hub)
-
-### Open Settings
-
-In the Hub, open **Settings** and follow these steps:
-
-- **Main Neural Folder** – set this to the same folder that contains `pt_hub.py` (easiest option).  
-- **Coins (comma)** – enter a comma‑separated list of coins, e.g. `BTC,ETH,SOL,BNB,XRP`. The bot will train the AI and trade `COIN-USDT` pairs on KuCoin for these symbols.
-- **Trade Start Level** – default is `3` (trade starts when LONG reaches at least that level while SHORT is `0`).
-- **Start Allocation %** – controls the size of the first entry relative to total account value.
-- **DCA Multiplier / DCA Levels / Max DCA buys per 24h** – controls how aggressively the bot averages down.
-- **Trailing PM settings** – controls the base profit line and trailing gap used for exits.
-
-Then, near the bottom of the window, you will see the **KuCoin API** section:
-
-1. Click **Setup Wizard**.
-2. On the KuCoin website go to **API Management** and create a new API key:
-   - enable at least the **General** and **Trade** permissions (spot trading),  
-   - choose your own **Passphrase** (remember it).
-3. From KuCoin, copy:
-   - **API Key**,  
-   - **API Secret**,  
-   - **Passphrase**.
-4. Paste these three values into the wizard fields in the Hub (**API Key / API Secret / Passphrase**).
-5. Optionally click **Test Connection** (checks that the app can reach KuCoin’s public API).
-6. Click **Save**.
-
-After saving, three files will be created in your project folder:
-
-- `k_key.txt` – KuCoin API Key  
-- `k_secret.txt` – KuCoin API Secret  
-- `k_pass.txt` – KuCoin API Passphrase  
-
-These files contain sensitive credentials – **keep them private** and never share them with anyone.
-
-PowerTrader AI uses a simple folder layout:  
-**BTC uses the main folder**, and other coins use their own subfolders (e.g. `ETH\`), just like in the original version.
-
----
-
-## Step 6 — Train (inside the Hub)
-
-Training builds the system’s coin “memory” so it can generate signals.
-
-1. In the Hub, click **Train All**.
-2. Wait until training finishes.
-
-Notes:
-
-- The Hub / runner now use a **training freshness** check, not just “file exists” logic.
-- If a coin is missing its training timestamp or the training is considered stale, the system will keep that coin in a not-ready state until it is retrained.
-
----
-
-## Step 7 — Start the system (inside the Hub)
-
-When all coins have completed training, click:
-
-1. **Start All**
-
-The Hub will:  
-**start pt_thinker.py**, wait until it is ready, then it will **start pt_trader.py**.  
-You don’t need to manually start separate programs. The hub handles everything!
-
-Important runtime behavior in this fork:
-
-- The trader is started only after the runner reports **real prediction readiness**, not just process startup.
-- If an API hiccup causes a temporary missing price / holdings snapshot, the bot falls back to the last known-good cached values instead of writing a fake account-value crash to the GUI.
-- If a trailing sell fails for a transient reason, the trader can retry that exit for a short time while the position is still safely in profit.
-
----
-
-## Neural Levels (the LONG/SHORT numbers)
-
-- These are signal strength levels from low to high.
-- They are the predicted high and low prices for all timeframes from 1hr to 1wk.
-- They are used to show how stretched a coin's price is and for determining when to start trades and potentially when to DCA for the first few levels of DCA (Whichever price is higher, the Neural level or the hardcoded drawdown % for the current DCA level.
-- Higher number = stronger signal.
-- LONG = buy-direction signal. SHORT = No-start signal
-
-A TRADE WILL START FOR A COIN IF THAT COIN REACHES A LONG LEVEL OF 3 OR HIGHER WHILE HAVING A SHORT LEVEL OF 0! This is adjustable in the settings.
-
----
-
-## Adding more coins (later)
-
-1. Open **Settings**
-2. Add one new coin
-3. Save
-4. Click **Train All**, wait for training to complete
-5. Click **Start All**
-
----
+Fully automated crypto spot trading powered by a custom price-prediction AI and a structured, tiered DCA system.
+
+## What Is Different In This Fork
+This repository is a fork of the original PowerTrader_AI, which was built around Robinhood Crypto.
+This fork keeps the AI/trading philosophy, but rewires the live trading stack for KuCoin spot trading.
+
+Main fork differences:
+
+- Live trading in `pt_trader.py` uses KuCoin REST API with HMAC-SHA256 signing.
+- The Hub stores and reads runtime data from `hub_data/`:
+  - `trader_status.json`
+  - `trade_history.jsonl`
+  - `pnl_ledger.json`
+  - `account_value_history.jsonl`
+  - `runner_ready.json`
+- `pt_hub.py` starts the neural runner first and only starts the trader after the runner reports real readiness.
+- Training freshness is enforced. A coin is not considered ready just because files exist; it must have a recent training timestamp.
+- DCA, trailing-profit, and start-allocation settings are controlled from the Hub and hot-reloaded by the trader.
+- The trader keeps a local pending-order ledger so startup/restarts can reconcile unfinished orders safely.
+- Very old unresolved pending orders are quarantined into `stale_pending` instead of blocking startup forever.
+- `stale_pending` orders can be audited and repaired later from KuCoin order history using the order id as the source of truth.
+- Trade history and realized/open-position accounting are written locally for GUI display and restart recovery.
+- Dust positions are ignored for fresh-entry blocking and for most DCA/trailing decisions.
+- Trailing exits have a short-lived retry intent so a temporary API hiccup does not immediately waste a profitable exit.
+
+Important:
+KuCoin order history is the source of truth.
+The local `hub_data` files are the bot's working ledger/cache layer for the GUI and restart recovery.
+
+Useful recovery commands in this fork:
+
+- `python pt_trader.py --audit-stale-orders`
+  Dry-run audit of `stale_pending` against KuCoin order history.
+- `python pt_trader.py --repair-stale-orders`
+  Backfills confirmed missing trades from `stale_pending` into local history/ledger.
+
+## Philosophy
+This is my personal trading bot that I decided to make open source.
+I built this strategy to match my own goals. It is meant to be a framework/foundation that you can extend for your own use.
+
+I know there are "commonly expected" trading features missing, such as stop-loss behavior. That is intentional.
+This bot is designed around spot trading, long holding periods when needed, and averaging into worthwhile coins rather than mechanically selling at a loss.
+
+I believe the AI and the overall trading strategy are simple on purpose.
+The design is based on real trading experience and on what actually works for this system, not on making the stack look complicated.
+
+I am not selling anything. This bot is not a product. It is for experimentation and education.
+Do not fall for scams. PowerTrader AI is free and open source.
+
+IMPORTANT:
+This software places real trades automatically. You are responsible for everything it does to your money and your account.
+Keep your API keys private. I am not giving financial advice. I am not responsible for losses, security issues on your machine, or misuse of the software.
+
+## What The AI Is Doing
+The AI in this system is not an LLM and not a standard neural network.
+It is closer to an instance-based / kernel-style pattern-matching predictor with online reliability weighting.
+
+At training time, the system walks historical candles for each supported timeframe and stores memory patterns together with what happened on the following candle.
+At run time, it compares the current pattern with the saved memory set and builds weighted predicted candles across multiple timeframes.
+Those predicted highs/lows are the blue and orange levels shown in the UI.
+
+After real candles close, the system compares reality with prediction and adjusts the reliability weights of the memory patterns that participated in the forecast.
+
+## How The Trader Uses The Signals
+Trade start:
+- A fresh trade can start when the long signal reaches at least the configured start level and the short signal is `0`.
+- Default trade-start level is `3`.
+
+DCA:
+- DCA can trigger from either:
+  - the neural level assigned to the current DCA stage, or
+  - the hard drawdown threshold for that stage,
+  whichever is hit first.
+- The system also enforces a rolling max DCA count per 24 hours.
+
+Sell / trailing profit margin:
+- If no DCA happened, the base PM line starts at `+5.0%` by default.
+- If DCA happened, the base PM line starts at `+2.5%` by default.
+- Default trailing gap is `0.5%` behind the peak once trailing activates.
+
+In this fork, these values are configurable from the Hub:
+- Trade start level
+- Start allocation %
+- DCA multiplier
+- DCA levels
+- Max DCA buys per 24h
+- PM start % (no DCA / with DCA)
+- Trailing gap %
+
+These settings are hot-reloaded by the trader while the system is running.
+
+## Setup And First-Time Use (Windows)
+If you already have open spot positions on the same KuCoin account for coins managed by the bot, PowerTrader will treat those holdings as part of the managed positions.
+For the cleanest behavior, many users prefer to start with a clean KuCoin trade account or zero managed balances.
+
+### 1. Install Python
+1. Go to `python.org` and install Python.
+2. During install, enable `Add Python to PATH`.
+
+### 2. Download The Repo Files
+1. Create a folder for the bot, for example `C:\PowerTraderAI`.
+2. Copy the repository files into that folder.
+
+### 3. Install Dependencies
+From Command Prompt in the project folder:
+
+```bash
+python -m pip install setuptools
+python -m pip install -r requirements.txt
+```
+
+### 4. Start The Hub
+From the project folder:
+
+```bash
+python pt_hub.py
+```
+
+The Hub is the main app you use day to day.
+
+### 5. Configure The Hub
+Open `Settings` in the Hub and set:
+- Main neural folder
+- Coin list
+- Trade start level
+- Start allocation %
+- DCA multiplier / DCA levels / max DCA buys per 24h
+- Trailing PM values
+
+In the KuCoin API section:
+1. Open the Setup Wizard.
+2. Create a KuCoin API key with at least `General` and `Trade` permissions.
+3. Copy API key, secret, and passphrase into the wizard.
+4. Save.
+
+This creates:
+- `k_key.txt`
+- `k_secret.txt`
+- `k_pass.txt`
+
+Keep these files private.
+
+### 6. Train
+In the Hub:
+1. Click `Train All`.
+2. Wait for training to finish.
+
+The Hub uses training freshness, not only file existence. If a coin is stale or missing its training timestamp, it stays not-ready until retrained.
+
+### 7. Start The System
+In the Hub:
+1. Click `Start All`.
+
+The Hub will:
+1. start `pt_thinker.py`
+2. wait for `runner_ready.json` to report readiness
+3. start `pt_trader.py`
+
+Runtime notes for this fork:
+- The trader is gated on real runner readiness.
+- Temporary API misses fall back to cached good values where possible to avoid fake account crashes in the GUI.
+- Pending/stale order recovery is built into trader startup.
+
+## Neural Levels
+- Levels run from low to high signal strength.
+- They come from predicted highs/lows across timeframes.
+- LONG is the buy-direction signal.
+- SHORT is the no-start / opposing signal.
+- By default, a fresh trade can start when LONG is at least `3` and SHORT is `0`.
+
+## Adding More Coins Later
+1. Open `Settings`.
+2. Add coin symbols.
+3. Save.
+4. Retrain.
+5. Start the system again.
 
 ## Donate
-
-PowerTrader AI is COMPLETELY free and open source! If you want to support the project, you can donate or become a member:
-
-- Cash App: **$garagesteve**
-- PayPal: **@garagesteve**
-- Facebook (Subscribe to my Facebook page for only $1/month): **https://www.facebook.com/stephen.bryant.hughes**
-
----
+PowerTrader AI is free and open source. If you want to support the project:
+- Cash App: `$garagesteve`
+- PayPal: `@garagesteve`
+- Facebook: `https://www.facebook.com/stephen.bryant.hughes`
 
 ## License
-
-PowerTrader AI is released under the **Apache 2.0** license.
-
----
-
-IMPORTANT: This software places real trades automatically. You are responsible for everything it does to your money and your account. Keep your API keys private. I am not giving financial advice. I am not responsible for any losses incurred or any security breaches to your computer (the code is entirely open source and can be confirmed non-malicious). You are fully responsible for doing your own due diligence to learn and understand this trading system and to use it properly. You are fully responsible for all of your money and all of the bot's actions, and any gains or losses.
+PowerTrader AI is released under the Apache 2.0 license.
