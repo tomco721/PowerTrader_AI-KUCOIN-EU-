@@ -333,9 +333,9 @@ DEFAULT_SETTINGS = {
         "1hour", "2hour", "4hour", "8hour", "12hour",
         "1day", "1week"
     ],
-    "candles_limit": 120,
+    "candles_limit": 250,
     "ui_refresh_seconds": 1.0,
-    "chart_refresh_seconds": 10.0,
+    "chart_refresh_seconds": 4.0,
     "hub_data_dir": "",  # if blank, defaults to <this_dir>/hub_data
     "script_neural_runner2": "pt_thinker.py",
     "script_neural_trainer": "pt_trainer.py",
@@ -1903,11 +1903,62 @@ class PowerTraderHub(tk.Tk):
 
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
-        # normalize
-        merged["coins"] = [c.upper().strip() for c in merged.get("coins", [])]
+
+        coins_raw = merged.get("coins", []) or []
+        if isinstance(coins_raw, str):
+            coins_raw = [x.strip() for x in coins_raw.replace("\n", ",").split(",")]
+        if not isinstance(coins_raw, (list, tuple)):
+            coins_raw = []
+        coin_clean = []
+        coin_seen = set()
+        for v in coins_raw:
+            s = str(v).upper().strip()
+            if not s or s in coin_seen:
+                continue
+            coin_seen.add(s)
+            coin_clean.append(s)
+        if not coin_clean:
+            coin_clean = list(DEFAULT_SETTINGS.get("coins", ["BTC"]))
+        merged["coins"] = coin_clean
+
+        # Normalize chart timeframes + default timeframe so a hand-edited or partial
+        # settings file does not crash chart selection on startup.
+        tfs = merged.get("timeframes", None)
+        if tfs is None:
+            tfs = DEFAULT_SETTINGS.get("timeframes", [])
+        if isinstance(tfs, str):
+            tfs = [x.strip() for x in tfs.replace("\n", ",").split(",")]
+        if not isinstance(tfs, (list, tuple)):
+            tfs = []
+
+        tf_clean = []
+        tf_seen = set()
+        for v in tfs:
+            s = str(v).strip()
+            if not s or s in tf_seen:
+                continue
+            tf_seen.add(s)
+            tf_clean.append(s)
+        if not tf_clean:
+            tf_clean = list(DEFAULT_SETTINGS.get("timeframes", ["1hour"]))
+        merged["timeframes"] = tf_clean
+
+        dtf = str(merged.get("default_timeframe") or "").strip()
+        if (not dtf) or (dtf not in merged["timeframes"]):
+            dtf = merged["timeframes"][0] if merged["timeframes"] else "1hour"
+        merged["default_timeframe"] = dtf
+
+        # Best-effort: write back healed settings so the file becomes self-contained.
+        try:
+            if data != merged:
+                _safe_write_json(settings_path, merged)
+        except Exception:
+            pass
+
         return merged
 
     def _save_settings(self) -> None:
+
         settings_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), SETTINGS_FILE)
         _safe_write_json(settings_path, self.settings)
 
@@ -2029,14 +2080,21 @@ class PowerTraderHub(tk.Tk):
         except Exception:
             pass
 
-        # LEFT: vertical split (Controls, Live Output)
-        left_split = ttk.Panedwindow(left, orient="vertical")
-        left_split.pack(fill="both", expand=True, padx=8, pady=8)
+        # Use padded inner containers so both sides keep a cleaner visual gutter
+        # without changing the functional pane structure.
+        left_inner = ttk.Frame(left)
+        left_inner.pack(fill="both", expand=True, padx=8, pady=8)
 
+        right_inner = ttk.Frame(right)
+        right_inner.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # LEFT: vertical split (Controls, Live Output)
+        left_split = ttk.Panedwindow(left_inner, orient="vertical")
+        left_split.pack(fill="both", expand=True)
 
         # RIGHT: vertical split (Charts on top, Trades+History underneath)
-        right_split = ttk.Panedwindow(right, orient="vertical")
-        right_split.pack(fill="both", expand=True, padx=8, pady=8)
+        right_split = ttk.Panedwindow(right_inner, orient="vertical")
+        right_split.pack(fill="both", expand=True)
 
         # Keep references so we can clamp sash positions later
         self._pw_outer = outer
@@ -2764,6 +2822,7 @@ class PowerTraderHub(tk.Tk):
             "dca_24h",
             "next_dca",
             "trail_line",     # keep trail line column
+            "exit_hold",
         )
 
         header_labels = {
@@ -2779,6 +2838,7 @@ class PowerTraderHub(tk.Tk):
             "dca_24h": "DCA 24h",
             "next_dca": "Next DCA",
             "trail_line": "Trail Line",
+            "exit_hold": "Exit Hold",
         }
 
         trades_table_wrap = ttk.Frame(trades_frame)
@@ -2801,6 +2861,7 @@ class PowerTraderHub(tk.Tk):
         self.trades_tree.column("next_dca", width=160)
         self.trades_tree.column("dca_stages", width=90)
         self.trades_tree.column("dca_24h", width=80)
+        self.trades_tree.column("exit_hold", width=105)
 
         ysb = ttk.Scrollbar(trades_table_wrap, orient="vertical", command=self.trades_tree.yview)
         xsb = ttk.Scrollbar(trades_table_wrap, orient="horizontal", command=self.trades_tree.xview)
@@ -2839,6 +2900,7 @@ class PowerTraderHub(tk.Tk):
                 "dca_24h": 80,
                 "next_dca": 160,
                 "trail_line": 110,
+                "exit_hold": 105,
             }
             base_total = sum(base.get(c, 110) for c in cols) or 1
             scale = avail / base_total
@@ -3983,6 +4045,16 @@ class PowerTraderHub(tk.Tk):
             next_dca = pos.get("next_dca_display", "")
 
             trail_line = pos.get("trail_line", 0.0)
+            exit_hold_active = bool(pos.get("exit_hold_active", False))
+            exit_hold_age_sec = float(pos.get("exit_hold_age_sec", 0.0) or 0.0)
+            exit_hold_reason = str(pos.get("exit_hold_reason", "") or "").strip()
+            if exit_hold_active:
+                hold_age_disp = int(max(0.0, round(exit_hold_age_sec)))
+                exit_hold_display = f"ON ({hold_age_disp}s)"
+                if exit_hold_reason:
+                    exit_hold_display = f"{exit_hold_display} {exit_hold_reason}"
+            else:
+                exit_hold_display = ""
 
             self.trades_tree.insert(
                 "",
@@ -4000,6 +4072,7 @@ class PowerTraderHub(tk.Tk):
                     dca_24h_display,
                     next_dca,
                     _fmt_price(trail_line),  # trail line is a price level
+                    exit_hold_display,
                 ),
             )
 
@@ -4101,6 +4174,9 @@ class PowerTraderHub(tk.Tk):
                         txt += f" | realized={float(pnl):+.2f}"
                     except Exception:
                         txt += f" | realized={pnl}"
+
+                if bool(obj.get("exit_hold_used", False)):
+                    txt += " | exit-hold"
 
                 self.hist_list.insert("end", txt)
             except Exception:

@@ -15,19 +15,27 @@ Main fork differences:
   - `account_value_history.jsonl`
   - `runner_ready.json`
 - `pt_hub.py` starts the neural runner first and only starts the trader after the runner reports real readiness.
+- The Hub now self-heals chart settings (`timeframes`, `default_timeframe`) on load so partial or hand-edited config files do not break the chart UI.
+- The Hub also adopts a small safe UI polish pass from the beta layout: cleaner pane padding and faster chart defaults (`chart_refresh_seconds=4`, `candles_limit=250`) without importing Robinhood/LTH features.
 - Training freshness is enforced. A coin is not considered ready just because files exist; it must have a recent training timestamp.
 - DCA, trailing-profit, and start-allocation settings are controlled from the Hub and hot-reloaded by the trader.
 - The trader keeps a local pending-order ledger so startup/restarts can reconcile unfinished orders safely.
 - Very old unresolved pending orders are quarantined into `stale_pending` instead of blocking startup forever.
 - `stale_pending` orders can be audited and repaired later from KuCoin order history using the order id as the source of truth.
 - Trade history and realized/open-position accounting are written locally for GUI display and restart recovery.
+- The trader now prefers order-derived fill notional/fees from KuCoin order detail (`dealFunds` / `dealSize`) for local accounting, with buying-power deltas kept only as a fallback/debug path.
+- `pnl_ledger.json` recovery is hardened: startup can recover from the main file, `.bak`, or `.tmp` if the primary JSON is damaged.
 - Telegram trade notifications can be configured from the Hub for confirmed BUY, DCA BUY, and SELL events.
 - Dust positions are ignored for fresh-entry blocking and for most DCA/trailing decisions.
 - Trailing exits have a short-lived retry intent so a temporary API hiccup does not immediately waste a profitable exit.
+- No-DCA trailing exits also have a guarded neural-aware hold V1: if LONG is still strong and SHORT is zero, the bot may delay the sell for up to 10 seconds, but only while price remains above the base PM line / profit floor.
+- The Hub Current Trades table now shows a small `Exit Hold` indicator when that neural hold is active.
+- Trade History now adds a minimal `exit-hold` marker on sells where that neural hold logic was used during the trade.
 
 Important:
 KuCoin order history is the source of truth.
 The local `hub_data` files are the bot's working ledger/cache layer for the GUI and restart recovery.
+For accounting, prefer the order's own fill payload first; use account balance deltas only as a fallback when exact fill amounts are unavailable.
 
 Useful recovery commands in this fork:
 
@@ -79,6 +87,7 @@ Sell / trailing profit margin:
 - If no DCA happened, the base PM line starts at `+5.0%` by default.
 - If DCA happened, the base PM line starts at `+2.5%` by default.
 - Default trailing gap is `0.5%` behind the peak once trailing activates.
+- In this fork, no-DCA trailing sells also have a strict neural-aware hold V1: the sell may be delayed briefly only when LONG stays strong, SHORT stays `0`, and the trade remains safely above the protected profit floor.
 
 In this fork, these values are configurable from the Hub:
 - Trade start level
@@ -166,7 +175,7 @@ Message contents in V1:
 - quantity
 - fill price
 - realized PnL on SELL
-- buying power
+- buying power (display / fallback context, not the primary accounting source)
 - total account value
 - brief list of open trades
 

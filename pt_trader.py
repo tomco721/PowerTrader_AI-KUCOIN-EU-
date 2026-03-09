@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import shutil
 import uuid
 import time
 import math
@@ -43,6 +44,16 @@ EXIT_INTENT_MAX_RETRIES = 3        # Max additional retries after the initial at
 EXIT_INTENT_RETRY_BACKOFF_SEC = 15 # Min seconds between retries for the same coin
 EXIT_INTENT_MAX_DROP_BELOW_PM_PCT = 0.5  # Allow at most this much below base PM line on retry
 EXIT_FEE_BUFFER_PCT = 0.2          # Extra buffer over avg_cost_basis to cover fees/slippage on retry
+
+# Neural-aware trailing sell V1:
+# - applies only to trades with NO DCA levels hit
+# - may delay a trailing sell briefly when neural still looks strongly bullish
+# - must never turn a protected profit into a loss
+NEURAL_EXIT_HOLD_ENABLED = True
+NEURAL_EXIT_HOLD_MAX_SEC = 10
+NEURAL_EXIT_HOLD_LONG_MIN = 2
+NEURAL_EXIT_HOLD_SHORT_MAX = 0
+NEURAL_EXIT_HOLD_MIN_PROFIT_PCT = 0.25
 
 # Pending-order reconcile hardening:
 # - Never block startup forever on unresolved pending orders.
@@ -435,6 +446,11 @@ class CryptoAPITrading:
         #           "attempts": int, "last_attempt_ts": float} }
         self.exit_intents: Dict[str, dict] = {}
 
+        # Short-lived neural hold before a trailing sell is allowed to fire.
+        # This is intentionally strict and only applies to profitable no-DCA trades.
+        self.exit_hold_intents: Dict[str, dict] = {}
+        self.exit_hold_used_flags: Dict[str, bool] = {}
+
         self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
         self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
 
@@ -481,6 +497,16 @@ class CryptoAPITrading:
             os.replace(tmp, path)
         except Exception:
             pass
+
+    def _atomic_read_json(self, path: str) -> Optional[dict]:
+        try:
+            if not os.path.isfile(path):
+                return None
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def _log_soft_error(self, where: str, err: Optional[Exception] = None, **ctx: Any) -> None:
         """
@@ -564,37 +590,63 @@ class CryptoAPITrading:
             print(traceback.format_exc())
 
     def _load_pnl_ledger(self) -> dict:
+        def _upgrade(data: Optional[dict]) -> dict:
+            if not isinstance(data, dict):
+                data = {}
+            data.setdefault("total_realized_profit_usd", 0.0)
+            data.setdefault("last_updated_ts", time.time())
+            data.setdefault("open_positions", {})
+            data.setdefault("pending_orders", {})
+            data.setdefault("stale_pending", {})
+            return data
+
         try:
-            if os.path.isfile(PNL_LEDGER_PATH):
-                with open(PNL_LEDGER_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f) or {}
-                if not isinstance(data, dict):
-                    data = {}
-                # Back-compat upgrades
-                data.setdefault("total_realized_profit_usd", 0.0)
-                data.setdefault("last_updated_ts", time.time())
-                data.setdefault("open_positions", {})   # { "BTC": {"usd_cost": float, "qty": float} }
-                data.setdefault("pending_orders", {})   # { "<order_id>": {...} }
-                data.setdefault("stale_pending", {})    # { "<order_id>": {..., "stale_reason": "..."} }
-                return data
+            data = self._atomic_read_json(PNL_LEDGER_PATH)
+            if isinstance(data, dict):
+                return _upgrade(data)
+
+            bak_path = f"{PNL_LEDGER_PATH}.bak"
+            data = self._atomic_read_json(bak_path)
+            if isinstance(data, dict):
+                try:
+                    self._atomic_write_json(PNL_LEDGER_PATH, data)
+                except Exception:
+                    pass
+                return _upgrade(data)
+
+            tmp_path = f"{PNL_LEDGER_PATH}.tmp"
+            data = self._atomic_read_json(tmp_path)
+            if isinstance(data, dict):
+                try:
+                    self._atomic_write_json(PNL_LEDGER_PATH, data)
+                except Exception:
+                    pass
+                return _upgrade(data)
         except Exception as e:
             self._log_soft_error("_load_pnl_ledger", e, path=PNL_LEDGER_PATH)
-        return {
+
+        return _upgrade({
             "total_realized_profit_usd": 0.0,
             "last_updated_ts": time.time(),
             "open_positions": {},
             "pending_orders": {},
             "stale_pending": {},
-        }
+        })
 
     def _save_pnl_ledger(self) -> None:
         try:
             self._pnl_ledger["last_updated_ts"] = time.time()
+            if os.path.isfile(PNL_LEDGER_PATH):
+                try:
+                    shutil.copyfile(PNL_LEDGER_PATH, f"{PNL_LEDGER_PATH}.bak")
+                except Exception:
+                    pass
             self._atomic_write_json(PNL_LEDGER_PATH, self._pnl_ledger)
         except Exception as e:
             self._log_soft_error("_save_pnl_ledger", e, path=PNL_LEDGER_PATH)
 
     def _trade_history_has_order_id(self, order_id: str) -> bool:
+
         try:
             if not order_id:
                 return False
@@ -712,9 +764,11 @@ class CryptoAPITrading:
             result["status"] = "lookup_failed"
             return result
 
-        filled_qty, avg_price = self._extract_fill_from_order(order)
+        filled_qty, avg_price, notional_usd, fees_usd = self._extract_amounts_and_fees_from_order(order)
         result["filled_qty"] = float(filled_qty or 0.0)
         result["avg_price"] = float(avg_price) if avg_price is not None else None
+        result["notional_usd"] = float(notional_usd) if notional_usd is not None else None
+        result["fees_usd"] = float(fees_usd) if fees_usd is not None else None
 
         if not self._is_order_terminal(order) and not self._is_order_filled(order):
             result["status"] = "non_terminal"
@@ -765,7 +819,8 @@ class CryptoAPITrading:
             pnl_pct=info.get("pnl_pct", None),
             tag=info.get("tag", None),
             order_id=order_id,
-            fees_usd=None,
+            notional_usd=notional_usd,
+            fees_usd=fees_usd,
             buying_power_before=buying_power_before,
             buying_power_after=buying_power_after,
             buying_power_delta=buying_power_delta,
@@ -911,11 +966,9 @@ class CryptoAPITrading:
     def _extract_fill_from_order(self, order: dict) -> tuple:
         """Returns (filled_qty, avg_fill_price). avg_fill_price may be None."""
         try:
-            # KuCoin order format: filledSize, dealSize, dealFunds
             filled_qty = 0.0
             avg_price = None
-            
-            # Try to get filled quantity
+
             for k in ("filled_quantity", "filledSize", "dealSize", "filled_asset_quantity"):
                 if k in order:
                     try:
@@ -925,8 +978,7 @@ class CryptoAPITrading:
                             break
                     except Exception:
                         continue
-            
-            # Try to calculate average price from dealFunds / dealSize
+
             deal_funds = None
             deal_size = None
             for k in ("dealFunds", "deal_funds", "filled_funds"):
@@ -936,7 +988,7 @@ class CryptoAPITrading:
                         break
                     except Exception:
                         continue
-            
+
             for k in ("dealSize", "deal_size", "filledSize", "filled_quantity"):
                 if k in order:
                     try:
@@ -944,11 +996,10 @@ class CryptoAPITrading:
                         break
                     except Exception:
                         continue
-            
+
             if deal_funds and deal_size and deal_size > 0:
                 avg_price = deal_funds / deal_size
-            
-            # Fallback to price field if available
+
             if avg_price is None:
                 for k in ("average_price", "avg_price", "price", "effective_price", "dealPrice"):
                     if k in order:
@@ -964,7 +1015,81 @@ class CryptoAPITrading:
         except Exception:
             return 0.0, None
 
+    def _extract_amounts_and_fees_from_order(self, order: dict) -> tuple:
+        """
+        KuCoin-native fill extraction.
+
+        Returns:
+            (filled_qty, avg_fill_price, notional_usd, fees_usd)
+        """
+        try:
+            filled_qty, avg_price = self._extract_fill_from_order(order)
+
+            def _to_float(v: Any) -> Optional[float]:
+                try:
+                    if v is None:
+                        return None
+                    if isinstance(v, (int, float)):
+                        return float(v)
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if not s:
+                            return None
+                        return float(s)
+                except Exception:
+                    return None
+                return None
+
+            raw = order.get("_raw", {}) if isinstance(order, dict) else {}
+            deal_funds = None
+            for src in (order, raw):
+                if not isinstance(src, dict):
+                    continue
+                for k in ("dealFunds", "deal_funds", "filled_funds", "funds", "filledValue", "dealValue"):
+                    v = _to_float(src.get(k))
+                    if v is not None and v > 0.0:
+                        deal_funds = float(v)
+                        break
+                if deal_funds is not None:
+                    break
+
+            notional_usd = None
+            if deal_funds is not None and deal_funds > 0.0:
+                notional_usd = float(deal_funds)
+            elif filled_qty > 0.0 and avg_price is not None and avg_price > 0.0:
+                notional_usd = float(filled_qty) * float(avg_price)
+
+            fee_total = 0.0
+            fee_found = False
+            for src in (order, raw):
+                if not isinstance(src, dict):
+                    continue
+                for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd", "dealFee"):
+                    v = src.get(fk)
+                    parsed = None
+                    if isinstance(v, dict):
+                        for subk in ("amount", "value", "fee", "usd_amount", "quantity"):
+                            parsed = _to_float(v.get(subk))
+                            if parsed is not None:
+                                break
+                    else:
+                        parsed = _to_float(v)
+                    if parsed is not None:
+                        fee_total += abs(float(parsed))
+                        fee_found = True
+
+            fees_usd = float(fee_total) if fee_found else None
+            return (
+                float(filled_qty or 0.0),
+                (float(avg_price) if avg_price is not None else None),
+                (float(notional_usd) if notional_usd is not None else None),
+                fees_usd,
+            )
+        except Exception:
+            return 0.0, None, None, None
+
     def _wait_for_order_terminal(self, symbol: str, order_id: str) -> Optional[dict]:
+
         """Blocks until order is filled/canceled/rejected, then returns the order dict."""
         # KuCoin order statuses: "new", "match", "open", "done", "pending", "active", "filled"
         terminal = {"done", "filled", "canceled", "cancelled", "rejected", "failed", "error"}
@@ -1269,35 +1394,39 @@ class CryptoAPITrading:
         side: str,
         symbol: str,
         qty: float,
-        price: Optional[float] = None,
+        price: Optional[float],
         avg_cost_basis: Optional[float] = None,
         pnl_pct: Optional[float] = None,
         tag: Optional[str] = None,
         order_id: Optional[str] = None,
+        notional_usd: Optional[float] = None,
         fees_usd: Optional[float] = None,
         buying_power_before: Optional[float] = None,
         buying_power_after: Optional[float] = None,
         buying_power_delta: Optional[float] = None,
+        exit_hold_used: Optional[bool] = None,
         ts_override: Optional[float] = None,
     ) -> None:
         """
         Minimal local ledger for GUI:
         - append trade_history.jsonl
-        - update pnl_ledger.json on sells (now using buying power delta when available)
+        - update pnl_ledger.json using exact order notional when available
         - persist per-coin open position cost (USD) so realized profit is exact
         """
         ts = float(ts_override) if ts_override is not None else time.time()
 
         side_l = str(side or "").lower().strip()
         base = str(symbol or "").upper().split("-")[0].strip()
+        if exit_hold_used is None:
+            exit_hold_used = bool(self.exit_hold_used_flags.get(base, False)) if base else False
 
-        # Ensure ledger keys exist (back-compat)
         try:
             if not isinstance(self._pnl_ledger, dict):
                 self._pnl_ledger = {}
             self._pnl_ledger.setdefault("total_realized_profit_usd", 0.0)
             self._pnl_ledger.setdefault("open_positions", {})
             self._pnl_ledger.setdefault("pending_orders", {})
+            self._pnl_ledger.setdefault("stale_pending", {})
         except Exception as e:
             self._log_soft_error(
                 "_record_trade.ensure_ledger_keys",
@@ -1308,50 +1437,67 @@ class CryptoAPITrading:
         realized = None
         position_cost_used = None
         position_cost_after = None
+        notional = None
+        fee_val = None
 
-        # --- Exact USD-based accounting (your design) ---
-        if base and (buying_power_delta is not None):
+        try:
+            if notional_usd is not None:
+                notional = max(0.0, float(notional_usd))
+        except Exception:
+            notional = None
+
+        try:
+            if fees_usd is not None:
+                fee_val = max(0.0, float(fees_usd))
+        except Exception:
+            fee_val = None
+
+        try:
+            bp_delta = float(buying_power_delta) if buying_power_delta is not None else None
+        except Exception:
+            bp_delta = None
+
+        if base:
             try:
-                bp_delta = float(buying_power_delta)
-            except Exception:
-                bp_delta = None
+                open_pos = self._pnl_ledger.get("open_positions", {})
+                if not isinstance(open_pos, dict):
+                    open_pos = {}
+                    self._pnl_ledger["open_positions"] = open_pos
 
-            if bp_delta is not None:
-                try:
-                    open_pos = self._pnl_ledger.get("open_positions", {})
-                    if not isinstance(open_pos, dict):
-                        open_pos = {}
-                        self._pnl_ledger["open_positions"] = open_pos
+                pos = open_pos.get(base, None)
+                if not isinstance(pos, dict):
+                    pos = {"usd_cost": 0.0, "qty": 0.0}
+                    open_pos[base] = pos
 
-                    pos = open_pos.get(base, None)
-                    if not isinstance(pos, dict):
-                        pos = {"usd_cost": 0.0, "qty": 0.0}
-                        open_pos[base] = pos
+                pos_usd_cost = float(pos.get("usd_cost", 0.0) or 0.0)
+                pos_qty = float(pos.get("qty", 0.0) or 0.0)
+                q = float(qty or 0.0)
 
-                    pos_usd_cost = float(pos.get("usd_cost", 0.0) or 0.0)
-                    pos_qty = float(pos.get("qty", 0.0) or 0.0)
-
-                    q = float(qty or 0.0)
-
-                    if side_l == "buy":
-                        usd_used = -bp_delta  # buying power drops on buys
+                if side_l == "buy":
+                    usd_used = None
+                    if notional is not None:
+                        usd_used = float(notional) + float(fee_val or 0.0)
+                    elif bp_delta is not None:
+                        usd_used = -bp_delta
                         if usd_used < 0.0:
                             usd_used = 0.0
 
+                    if usd_used is not None:
                         pos["usd_cost"] = float(pos_usd_cost) + float(usd_used)
                         pos["qty"] = float(pos_qty) + float(q if q > 0.0 else 0.0)
-
                         position_cost_after = float(pos["usd_cost"])
-
-                        # Save because open position changed (needs to persist across restarts)
                         self._save_pnl_ledger()
 
-                    elif side_l == "sell":
-                        usd_got = bp_delta  # buying power rises on sells
-                        if usd_got < 0.0:
-                            usd_got = 0.0
+                elif side_l == "sell":
+                    proceeds = None
+                    if notional is not None:
+                        proceeds = float(notional) - float(fee_val or 0.0)
+                    elif bp_delta is not None:
+                        proceeds = bp_delta
+                        if proceeds < 0.0:
+                            proceeds = 0.0
 
-                        # If partial sell ever happens, allocate cost pro-rata by qty.
+                    if proceeds is not None:
                         if pos_qty > 0.0 and q > 0.0:
                             frac = min(1.0, float(q) / float(pos_qty))
                         else:
@@ -1359,39 +1505,33 @@ class CryptoAPITrading:
 
                         cost_used = float(pos_usd_cost) * float(frac)
                         position_cost_used = float(cost_used)
+                        realized = float(proceeds) - float(cost_used)
 
-                        # Prefer true cost basis from KuCoin when available, so realized USD matches pnl@trade %
-                        acb = float(avg_cost_basis) if avg_cost_basis is not None else None
-                        fee_val = float(fees_usd) if fees_usd is not None else 0.0
-                        if acb is not None and acb > 0 and price is not None and q > 0:
-                            cost_used_acb = acb * q
-                            realized = (float(price) - acb) * q - fee_val
-                            # Update ledger using true cost so it doesn't propagate old errors
-                            pos["usd_cost"] = float(pos_usd_cost) - float(cost_used_acb)
-                            pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
-                            position_cost_used = float(cost_used_acb)
-                        else:
-                            realized = float(usd_got) - float(cost_used)
-                            pos["usd_cost"] = float(pos_usd_cost) - float(cost_used)
-                            pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
-
+                        pos["usd_cost"] = float(pos_usd_cost) - float(cost_used)
+                        pos["qty"] = float(pos_qty) - float(q if q > 0.0 else 0.0)
                         position_cost_after = float(pos.get("usd_cost", 0.0) or 0.0)
+
                         self._pnl_ledger["total_realized_profit_usd"] = float(self._pnl_ledger.get("total_realized_profit_usd", 0.0) or 0.0) + float(realized)
 
-                        # Clean up tiny dust
                         if float(pos.get("qty", 0.0) or 0.0) <= 1e-12 or float(pos.get("usd_cost", 0.0) or 0.0) <= 1e-6:
                             open_pos.pop(base, None)
 
                         self._save_pnl_ledger()
+            except Exception:
+                pass
 
-                except Exception:
-                    pass
+        if realized is None and side_l == "sell" and bp_delta is not None:
+            try:
+                realized = float(bp_delta)
+                self._pnl_ledger["total_realized_profit_usd"] = float(self._pnl_ledger.get("total_realized_profit_usd", 0.0) or 0.0) + float(realized)
+                self._save_pnl_ledger()
+            except Exception:
+                realized = None
 
-        # --- Fallback (old behavior) if we couldn't compute from buying power ---
         if realized is None and side_l == "sell" and price is not None and avg_cost_basis is not None:
             try:
-                fee_val = float(fees_usd) if fees_usd is not None else 0.0
-                realized = (float(price) - float(avg_cost_basis)) * float(qty) - fee_val
+                fee_val_calc = float(fee_val or 0.0)
+                realized = (float(price) - float(avg_cost_basis)) * float(qty) - fee_val_calc
                 self._pnl_ledger["total_realized_profit_usd"] = float(self._pnl_ledger.get("total_realized_profit_usd", 0.0)) + float(realized)
                 self._save_pnl_ledger()
             except Exception:
@@ -1404,9 +1544,10 @@ class CryptoAPITrading:
             "symbol": symbol,
             "qty": qty,
             "price": price,
+            "notional_usd": float(notional) if notional is not None else None,
             "avg_cost_basis": avg_cost_basis,
             "pnl_pct": pnl_pct,
-            "fees_usd": fees_usd,
+            "fees_usd": float(fee_val) if fee_val is not None else None,
             "realized_profit_usd": realized,
             "order_id": order_id,
             "buying_power_before": float(buying_power_before) if buying_power_before is not None else None,
@@ -1414,8 +1555,11 @@ class CryptoAPITrading:
             "buying_power_delta": float(buying_power_delta) if buying_power_delta is not None else None,
             "position_cost_used_usd": float(position_cost_used) if position_cost_used is not None else None,
             "position_cost_after_usd": float(position_cost_after) if position_cost_after is not None else None,
+            "exit_hold_used": bool(exit_hold_used),
         }
         self._append_jsonl(TRADE_HISTORY_PATH, entry)
+        if side_l == "sell" and base:
+            self.exit_hold_used_flags.pop(base, None)
 
         self._send_trade_notification(
             side=side,
@@ -1427,8 +1571,8 @@ class CryptoAPITrading:
             buying_power_after=buying_power_after,
         )
 
-
     def _write_trader_status(self, status: dict) -> None:
+
         self._atomic_write_json(TRADER_STATUS_PATH, status)
 
     @staticmethod
@@ -1473,6 +1617,64 @@ class CryptoAPITrading:
 
         return s
 
+
+    def _has_pending_sell(self, full_symbol: str) -> bool:
+        try:
+            pending_orders = self._pnl_ledger.get("pending_orders", {}) or {}
+            for po in pending_orders.values():
+                if (
+                    str(po.get("symbol", "")).strip().upper() == str(full_symbol).strip().upper()
+                    and str(po.get("side", "")).strip().lower() == "sell"
+                ):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _should_start_neural_exit_hold(
+        self,
+        symbol: str,
+        triggered_levels: int,
+        current_sell_price: float,
+        base_pm_line: float,
+        avg_cost_basis: float,
+    ):
+        if not NEURAL_EXIT_HOLD_ENABLED:
+            return False, None
+        try:
+            if int(triggered_levels) != 0:
+                return False, None
+        except Exception:
+            return False, None
+
+        try:
+            current_sell_price = float(current_sell_price or 0.0)
+            base_pm_line = float(base_pm_line or 0.0)
+            avg_cost_basis = float(avg_cost_basis or 0.0)
+        except Exception:
+            return False, None
+
+        if current_sell_price <= 0.0 or base_pm_line <= 0.0 or avg_cost_basis <= 0.0:
+            return False, None
+
+        fee_floor = avg_cost_basis * (1.0 + (EXIT_FEE_BUFFER_PCT / 100.0))
+        min_profit_floor = avg_cost_basis * (1.0 + (NEURAL_EXIT_HOLD_MIN_PROFIT_PCT / 100.0))
+        profit_floor = max(base_pm_line, fee_floor, min_profit_floor)
+        if current_sell_price < profit_floor:
+            return False, None
+
+        long_signal = int(self._read_long_dca_signal(symbol))
+        short_signal = int(self._read_short_dca_signal(symbol))
+        if long_signal < int(NEURAL_EXIT_HOLD_LONG_MIN):
+            return False, None
+        if short_signal > int(NEURAL_EXIT_HOLD_SHORT_MAX):
+            return False, None
+
+        return True, {
+            "profit_floor": float(profit_floor),
+            "long_signal": int(long_signal),
+            "short_signal": int(short_signal),
+        }
 
     @staticmethod
     def _read_long_dca_signal(symbol: str) -> int:
@@ -2484,7 +2686,7 @@ class CryptoAPITrading:
                                 pass
                             return response
 
-                        filled_qty, avg_fill_price = self._extract_fill_from_order(order)
+                        filled_qty, avg_fill_price, notional_usd, fees_usd = self._extract_amounts_and_fees_from_order(order)
 
                         buying_power_after = self._get_buying_power()
                         buying_power_delta = float(buying_power_after) - float(buying_power_before)
@@ -2499,6 +2701,8 @@ class CryptoAPITrading:
                             pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
                             tag=tag,
                             order_id=order_id,
+                            notional_usd=float(notional_usd) if notional_usd is not None else None,
+                            fees_usd=float(fees_usd) if fees_usd is not None else None,
                             buying_power_before=buying_power_before,
                             buying_power_after=buying_power_after,
                             buying_power_delta=buying_power_delta,
@@ -2678,37 +2882,16 @@ class CryptoAPITrading:
         # Prefer normalized qty (what we actually submitted)
         actual_qty = float(normalized_qty)
         fees_usd = None
-
-        def _fee_to_float(v: Any) -> float:
-            try:
-                if v is None:
-                    return 0.0
-                if isinstance(v, (int, float)):
-                    return float(v)
-                if isinstance(v, str):
-                    return float(v)
-                if isinstance(v, dict):
-                    # common shapes: {"amount": "0.12"}, {"value": 0.12}, etc.
-                    for k in ("amount", "value", "usd_amount", "fee", "quantity"):
-                        if k in v:
-                            try:
-                                return float(v[k])
-                            except Exception:
-                                continue
-                return 0.0
-            except Exception:
-                return 0.0
+        notional_usd = None
 
         try:
             if order_id:
                 match = self._wait_for_order_terminal(symbol, order_id)
                 if not match:
-                    # Unknown status (timeout) -> leave pending and let reconcile handle it
                     print(f"[TRADER] Sell order {order_id} for {symbol} timed out waiting for terminal state; leaving in pending for reconcile.")
                     return response
 
                 if not self._is_order_filled(match):
-                    # Terminal but not filled (cancelled/rejected/...) -> clear pending and do not record a trade
                     try:
                         self._pnl_ledger.get("pending_orders", {}).pop(order_id, None)
                         self._save_pnl_ledger()
@@ -2721,35 +2904,7 @@ class CryptoAPITrading:
                         )
                     return response
 
-                execs = match.get("executions", []) or []
-                total_qty = 0.0
-                total_notional = 0.0
-                fee_total = 0.0
-
-                for ex in execs:
-                    try:
-                        q = float(ex.get("quantity", 0.0) or 0.0)
-                        p = float(ex.get("effective_price", 0.0) or 0.0)
-                        total_qty += q
-                        total_notional += (q * p)
-
-                        # Fees can show up under different keys; handle the common ones.
-                        for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                            if fk in ex:
-                                fee_total += _fee_to_float(ex.get(fk))
-                    except Exception:
-                        continue
-
-                # Some payloads include order-level fee fields too
-                for fk in ("fee", "fees", "fee_amount", "fee_usd", "fee_in_usd"):
-                    if fk in match:
-                        fee_total += _fee_to_float(match.get(fk))
-
-                if total_qty > 0.0 and total_notional > 0.0:
-                    actual_qty = total_qty
-                    actual_price = total_notional / total_qty
-
-                fees_usd = float(fee_total) if fee_total else 0.0
+                actual_qty, actual_price, notional_usd, fees_usd = self._extract_amounts_and_fees_from_order(match)
 
         except Exception as e:
             self._log_soft_error(
@@ -2781,6 +2936,7 @@ class CryptoAPITrading:
             pnl_pct=float(pnl_pct) if pnl_pct is not None else None,
             tag=tag,
             order_id=order_id,
+            notional_usd=float(notional_usd) if notional_usd is not None else None,
             fees_usd=float(fees_usd) if fees_usd is not None else None,
             buying_power_before=buying_power_before,
             buying_power_after=buying_power_after,
@@ -2839,6 +2995,7 @@ class CryptoAPITrading:
             # - peak/armed/was_above are cleared
             if (old_sig is not None) and (new_sig != old_sig):
                 self.trailing_pm = {}
+                self.exit_hold_intents = {}
 
             self._last_trailing_settings_sig = new_sig
         except Exception as e:
@@ -3049,6 +3206,9 @@ class CryptoAPITrading:
             trail_peak_disp = 0.0
             above_disp = False
             dist_to_trail_pct = 0.0
+            exit_hold_active = False
+            exit_hold_age_sec = 0.0
+            exit_hold_reason = ""
 
             if avg_cost_basis > 0 and value >= DUST_VALUE_USD:
                 pm_start_pct_disp = self.pm_start_pct_no_dca if int(triggered_levels) == 0 else self.pm_start_pct_with_dca
@@ -3070,6 +3230,20 @@ class CryptoAPITrading:
 
                 if trail_line_disp > 0:
                     dist_to_trail_pct = ((current_sell_price - trail_line_disp) / trail_line_disp) * 100.0
+
+                hold_disp = self.exit_hold_intents.get(symbol)
+                if isinstance(hold_disp, dict):
+                    exit_hold_active = True
+                    try:
+                        exit_hold_age_sec = max(0.0, time.time() - float(hold_disp.get("ts", time.time())))
+                    except Exception:
+                        exit_hold_age_sec = 0.0
+                    try:
+                        long_sig = int(hold_disp.get("long_signal", 0) or 0)
+                        short_sig = int(hold_disp.get("short_signal", 0) or 0)
+                        exit_hold_reason = f"L{long_sig}/S{short_sig}"
+                    except Exception:
+                        exit_hold_reason = ""
             file = open(symbol+'_current_price.txt', 'w+')
             file.write(str(current_buy_price))
             file.close()
@@ -3093,6 +3267,9 @@ class CryptoAPITrading:
                 "trail_line": float(trail_line_disp) if trail_line_disp else 0.0,
                 "trail_peak": float(trail_peak_disp) if trail_peak_disp else 0.0,
                 "dist_to_trail_pct": float(dist_to_trail_pct) if dist_to_trail_pct else 0.0,
+                "exit_hold_active": bool(exit_hold_active),
+                "exit_hold_age_sec": float(exit_hold_age_sec) if exit_hold_age_sec else 0.0,
+                "exit_hold_reason": str(exit_hold_reason or ""),
             }
 
 
@@ -3143,6 +3320,7 @@ class CryptoAPITrading:
                         "line": base_pm_line,
                         "peak": 0.0,
                         "was_above": False,
+                        "hold_used": False,
                         "settings_sig": settings_sig,
                     }
                     self.trailing_pm[symbol] = state
@@ -3172,6 +3350,7 @@ class CryptoAPITrading:
                 if state["active"]:
                     if current_sell_price > state["peak"]:
                         state["peak"] = current_sell_price
+                        state["hold_used"] = False
 
                     new_line = state["peak"] * (1.0 - trail_gap)
                     if new_line < base_pm_line:
@@ -3180,6 +3359,71 @@ class CryptoAPITrading:
                         state["line"] = new_line
 
                     now_ts = time.time()
+
+                    # --- Handle any existing neural hold intent for this symbol ---
+                    hold_intent = self.exit_hold_intents.get(symbol)
+                    hold_active = False
+                    if hold_intent:
+                        age = now_ts - float(hold_intent.get("ts", now_ts))
+                        release_line = float(hold_intent.get("release_line", base_pm_line) or base_pm_line)
+                        profit_floor = float(hold_intent.get("profit_floor", base_pm_line) or base_pm_line)
+
+                        if current_sell_price >= release_line:
+                            print(
+                                f"[TRADER] Releasing neural exit hold for {symbol}: "
+                                f"price recovered above release line {release_line:.8f}."
+                            )
+                            self.exit_hold_intents.pop(symbol, None)
+                        else:
+                            force_reason = None
+                            if current_sell_price < base_pm_line:
+                                force_reason = "below_base_pm_line"
+                            elif current_sell_price < profit_floor:
+                                force_reason = "below_profit_floor"
+                            else:
+                                short_now = int(self._read_short_dca_signal(symbol))
+                                if short_now > int(NEURAL_EXIT_HOLD_SHORT_MAX):
+                                    force_reason = f"short_signal_{short_now}"
+                                elif age >= float(NEURAL_EXIT_HOLD_MAX_SEC):
+                                    force_reason = "grace_window_expired"
+
+                            if force_reason:
+                                print(
+                                    f"[TRADER] Neural exit hold ended for {symbol}: {force_reason}. "
+                                    f"Proceeding with trailing sell."
+                                )
+                                self.exit_hold_intents.pop(symbol, None)
+                                if self._has_pending_sell(full_symbol):
+                                    print(f"[TRADER] Pending sell already exists for {symbol}; skipping forced sell from neural hold.")
+                                else:
+                                    response = self.place_sell_order(
+                                        str(uuid.uuid4()),
+                                        "sell",
+                                        "market",
+                                        full_symbol,
+                                        quantity,
+                                        expected_price=current_sell_price,
+                                        avg_cost_basis=avg_cost_basis,
+                                        pnl_pct=gain_loss_percentage_sell,
+                                        tag="TRAIL_SELL",
+                                    )
+
+                                    if (
+                                        response
+                                        and isinstance(response, dict)
+                                        and response.get("recorded_trade")
+                                    ):
+                                        trades_made = True
+                                        self.trailing_pm.pop(symbol, None)
+                                        self.exit_intents.pop(symbol, None)
+                                        self.exit_hold_intents.pop(symbol, None)
+                                        self._reset_dca_window_for_trade(symbol, sold=True)
+                                        print(f"  Successfully sold {quantity} {symbol} after neural hold.")
+                                        time.sleep(5)
+                                        holdings = self.get_holdings()
+                                        continue
+
+                        hold_active = bool(self.exit_hold_intents.get(symbol))
 
                     # --- Handle any existing exit intent for this symbol (retry logic) ---
                     intent = self.exit_intents.get(symbol)
@@ -3252,6 +3496,7 @@ class CryptoAPITrading:
                                         trades_made = True
                                         self.trailing_pm.pop(symbol, None)
                                         self.exit_intents.pop(symbol, None)
+                                        self.exit_hold_intents.pop(symbol, None)
                                         self._reset_dca_window_for_trade(symbol, sold=True)
                                         print(f"  Successfully sold {quantity} {symbol} (retry).")
                                         time.sleep(5)
@@ -3270,9 +3515,10 @@ class CryptoAPITrading:
                                     print(f"[TRADER] Giving up retrying exit for {symbol}: {reason}.")
                                     self.exit_intents.pop(symbol, None)
 
-                    # If there is an active exit intent, do not trigger a brand new one in the same tick.
+                    # If there is an active exit intent or neural hold intent, do not trigger a brand new one in the same tick.
                     intent = self.exit_intents.get(symbol)
-                    if not intent:
+                    hold_active = bool(self.exit_hold_intents.get(symbol))
+                    if not intent and not hold_active:
                         crossed_down = current_sell_price < state["line"]
 
                         if crossed_down:
@@ -3286,63 +3532,82 @@ class CryptoAPITrading:
                                     f"Sell price {current_sell_price:.8f} fell below trailing line {state['line']:.8f}."
                                 )
 
-                                # Register a fresh exit intent so we can safely retry if needed.
-                                self.exit_intents[symbol] = {
-                                    "ts": now_ts,
-                                    "base_pm_line": float(base_pm_line),
-                                    "avg_cost_basis": float(avg_cost_basis),
-                                    "attempts": 0,
-                                    "last_attempt_ts": 0.0,
-                                }
-
-                                # Neotváraj nový SELL, ak už na tento symbol visí pending SELL order.
-                                has_pending_sell = False
-                                try:
-                                    pending_orders = self._pnl_ledger.get("pending_orders", {}) or {}
-                                    for po in pending_orders.values():
-                                        if (
-                                            str(po.get("symbol", "")).strip().upper() == full_symbol
-                                            and str(po.get("side", "")).strip().lower() == "sell"
-                                        ):
-                                            has_pending_sell = True
-                                            break
-                                except Exception:
-                                    has_pending_sell = False
-
-                                if has_pending_sell:
-                                    print(f"[TRADER] Pending sell already exists for {symbol}; skipping new trailing sell order.")
-                                else:
-                                    response = self.place_sell_order(
-                                        str(uuid.uuid4()),
-                                        "sell",
-                                        "market",
-                                        full_symbol,
-                                        quantity,
-                                        expected_price=current_sell_price,
-                                        avg_cost_basis=avg_cost_basis,
-                                        pnl_pct=gain_loss_percentage_sell,
-                                        tag="TRAIL_SELL",
+                                started_hold = False
+                                if not bool(state.get("hold_used", False)):
+                                    can_hold, hold_meta = self._should_start_neural_exit_hold(
+                                        symbol=symbol,
+                                        triggered_levels=int(triggered_levels),
+                                        current_sell_price=float(current_sell_price),
+                                        base_pm_line=float(base_pm_line),
+                                        avg_cost_basis=float(avg_cost_basis),
                                     )
+                                    if can_hold and hold_meta:
+                                        self.exit_hold_intents[symbol] = {
+                                            "ts": now_ts,
+                                            "base_pm_line": float(base_pm_line),
+                                            "avg_cost_basis": float(avg_cost_basis),
+                                            "profit_floor": float(hold_meta.get("profit_floor", base_pm_line) or base_pm_line),
+                                            "release_line": float(state.get("line", base_pm_line) or base_pm_line),
+                                            "long_signal": int(hold_meta.get("long_signal", 0) or 0),
+                                            "short_signal": int(hold_meta.get("short_signal", 0) or 0),
+                                        }
+                                        state["hold_used"] = True
+                                        started_hold = True
+                                        print(
+                                            f"[TRADER] Neural exit hold started for {symbol}: "
+                                            f"long={int(hold_meta.get('long_signal', 0))}, "
+                                            f"short={int(hold_meta.get('short_signal', 0))}, "
+                                            f"profit_floor={float(hold_meta.get('profit_floor', base_pm_line)):.8f}, "
+                                            f"max_wait={float(NEURAL_EXIT_HOLD_MAX_SEC):.0f}s."
+                                        )
 
-                                    # Only treat this as a completed trade if place_sell_order
-                                    # actually managed to record it (order filled and written
-                                    # to trade_history/pnl_ledger).
-                                    if (
-                                        response
-                                        and isinstance(response, dict)
-                                        and response.get("recorded_trade")
-                                    ):
-                                        trades_made = True
-                                        self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
-                                        self.exit_intents.pop(symbol, None)
+                                if not started_hold:
+                                    # Register a fresh exit intent so we can safely retry if needed.
+                                    self.exit_intents[symbol] = {
+                                        "ts": now_ts,
+                                        "base_pm_line": float(base_pm_line),
+                                        "avg_cost_basis": float(avg_cost_basis),
+                                        "attempts": 0,
+                                        "last_attempt_ts": 0.0,
+                                    }
 
-                                        # Trade ended -> reset rolling 24h DCA window for this coin
-                                        self._reset_dca_window_for_trade(symbol, sold=True)
+                                    has_pending_sell = self._has_pending_sell(full_symbol)
 
-                                        print(f"  Successfully sold {quantity} {symbol}.")
-                                        time.sleep(5)
-                                        holdings = self.get_holdings()
-                                        continue
+                                    if has_pending_sell:
+                                        print(f"[TRADER] Pending sell already exists for {symbol}; skipping new trailing sell order.")
+                                    else:
+                                        response = self.place_sell_order(
+                                            str(uuid.uuid4()),
+                                            "sell",
+                                            "market",
+                                            full_symbol,
+                                            quantity,
+                                            expected_price=current_sell_price,
+                                            avg_cost_basis=avg_cost_basis,
+                                            pnl_pct=gain_loss_percentage_sell,
+                                            tag="TRAIL_SELL",
+                                        )
+
+                                        # Only treat this as a completed trade if place_sell_order
+                                        # actually managed to record it (order filled and written
+                                        # to trade_history/pnl_ledger).
+                                        if (
+                                            response
+                                            and isinstance(response, dict)
+                                            and response.get("recorded_trade")
+                                        ):
+                                            trades_made = True
+                                            self.trailing_pm.pop(symbol, None)  # clear per-coin trailing state on exit
+                                            self.exit_intents.pop(symbol, None)
+                                            self.exit_hold_intents.pop(symbol, None)
+
+                                            # Trade ended -> reset rolling 24h DCA window for this coin
+                                            self._reset_dca_window_for_trade(symbol, sold=True)
+
+                                            print(f"  Successfully sold {quantity} {symbol}.")
+                                            time.sleep(5)
+                                            holdings = self.get_holdings()
+                                            continue
                             else:
                                 # Cena spadla nielen pod trailing line, ale aj pod pôvodný PM štart line.
                                 # To znamená, že prvý beh trailing stopu sme "prepásli" (napr. počas reštartu
@@ -3352,6 +3617,8 @@ class CryptoAPITrading:
                                 state["line"] = base_pm_line
                                 state["peak"] = 0.0
                                 state["was_above"] = False
+                                state["hold_used"] = False
+                                self.exit_hold_intents.pop(symbol, None)
 
 
                 # Save this tick’s position relative to the line (needed for “above -> below” detection)
@@ -3443,6 +3710,7 @@ class CryptoAPITrading:
                         # DCA changes avg_cost_basis, so the PM line must be rebuilt from the new basis
                         # (this will re-init to 5% if DCA=0, or 2.5% if DCA>=1)
                         self.trailing_pm.pop(symbol, None)
+                        self.exit_hold_intents.pop(symbol, None)
 
                         trades_made = True
                         print(f"  Successfully placed DCA buy order for {symbol}.")
@@ -3567,6 +3835,7 @@ class CryptoAPITrading:
 
                 # Reset trailing PM state for this coin (fresh trade, fresh trailing logic)
                 self.trailing_pm.pop(base_symbol, None)
+                self.exit_hold_intents.pop(base_symbol, None)
 
 
                 print(
