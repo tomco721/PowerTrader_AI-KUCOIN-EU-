@@ -17,6 +17,10 @@ Main fork differences:
 - `pt_hub.py` starts the neural runner first and only starts the trader after the runner reports real readiness.
 - The Hub now self-heals chart settings (`timeframes`, `default_timeframe`) on load so partial or hand-edited config files do not break the chart UI.
 - The Hub also adopts a small safe UI polish pass from the beta layout: cleaner pane padding and faster chart defaults (`chart_refresh_seconds=4`, `candles_limit=250`) without importing Robinhood/LTH features.
+- The Hub bottom-right panel now uses tabs for `Current Trades` and `Trade History`, which keeps both views available without stacking them into a cramped split pane.
+- The `Current Trades` tab now includes a compact live summary row (`open positions / trailing active / exit hold`) and light row highlighting so important states stand out faster.
+- `Trade History` rows are now formatted coin-first and lightly color-coded by action type to make SELL / BUY / DCA scanning easier.
+- The Hub realized-profit label is now aligned to the visible account-history era: it sums realized SELL profit from the first timestamp in `account_value_history.jsonl` instead of blindly showing the full legacy ledger total.
 - Training freshness is enforced. A coin is not considered ready just because files exist; it must have a recent training timestamp.
 - DCA, trailing-profit, and start-allocation settings are controlled from the Hub and hot-reloaded by the trader.
 - The trader keeps a local pending-order ledger so startup/restarts can reconcile unfinished orders safely.
@@ -24,6 +28,7 @@ Main fork differences:
 - `stale_pending` orders can be audited and repaired later from KuCoin order history using the order id as the source of truth.
 - Trade history and realized/open-position accounting are written locally for GUI display and restart recovery.
 - The trader now prefers order-derived fill notional/fees from KuCoin order detail (`dealFunds` / `dealSize`) for local accounting, with buying-power deltas kept only as a fallback/debug path.
+- Live cost basis for active positions now prefers the local ledger's exact open-position cost (`pnl_ledger.json` `usd_cost / qty`) before falling back to exchange order history, so a missing older BUY in KuCoin history cannot fabricate a false profitable SELL.
 - `pnl_ledger.json` recovery is hardened: startup can recover from the main file, `.bak`, or `.tmp` if the primary JSON is damaged.
 - Telegram trade notifications can be configured from the Hub for confirmed BUY, DCA BUY, and SELL events.
 - Dust positions are ignored for fresh-entry blocking and for most DCA/trailing decisions.
@@ -128,6 +133,7 @@ python pt_hub.py
 ```
 
 The Hub is the main app you use day to day.
+The lower-right trade area now has separate tabs for `Current Trades` and `Trade History`, and the account box shows realized profit for the same date range used by the account value chart.
 
 ### 5. Configure The Hub
 Open `Settings` in the Hub and set:

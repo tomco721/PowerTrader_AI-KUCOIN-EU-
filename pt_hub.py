@@ -756,7 +756,7 @@ class CandleChart(ttk.Frame):
         # Reserve bottom space so date+time x tick labels are always visible
         # Also reserve right space so the price labels (Bid/Ask/DCA/Sell) can sit outside the plot.
         # Also reserve a bit of top space so the title never gets clipped.
-        self.fig.subplots_adjust(bottom=0.20, right=0.87, top=0.8)
+        self.fig.subplots_adjust(left=0.055, bottom=0.16, right=0.92, top=0.92)
 
         self.ax = self.fig.add_subplot(111)
         self._apply_dark_chart_style()
@@ -1205,7 +1205,7 @@ class AccountValueChart(ttk.Frame):
         # Reserve bottom space so date+time x tick labels are always visible
         # Also reserve right space so the price labels (Bid/Ask/DCA/Sell) can sit outside the plot.
         # Also reserve a bit of top space so the title never gets clipped.
-        self.fig.subplots_adjust(bottom=0.25, right=0.87, top=0.8)
+        self.fig.subplots_adjust(left=0.06, bottom=0.18, right=0.985, top=0.92)
 
         self.ax = self.fig.add_subplot(111)
         self._apply_dark_chart_style()
@@ -1597,7 +1597,7 @@ class PowerTraderHub(tk.Tk):
         # Minimal file-heartbeat watchdog.
         # It only acts on processes that are already running and watches hub_data timestamps for staleness.
         self._watchdog_runner_stale_sec = 30.0
-        self._watchdog_trader_stale_sec = 30.0
+        self._watchdog_trader_stale_sec = 120.0
         self._watchdog_restart_cooldown_sec = 60.0
         self._watchdog_last_restart_ts: Dict[str, float] = {"neural": 0.0, "trader": 0.0}
 
@@ -2391,7 +2391,7 @@ class PowerTraderHub(tk.Tk):
         self.lbl_acct_dca_single = ttk.Label(acct_box, text="DCA Levels (single): N/A")
         self.lbl_acct_dca_single.pack(anchor="w", padx=6, pady=(2, 0))
 
-        self.lbl_pnl = ttk.Label(acct_box, text="Total realized: N/A")
+        self.lbl_pnl = ttk.Label(acct_box, text="Realized since history start: N/A")
         self.lbl_pnl.pack(anchor="w", padx=6, pady=(2, 2))
 
 
@@ -2795,19 +2795,22 @@ class PowerTraderHub(tk.Tk):
 
 
         # ----------------------------
-        # RIGHT BOTTOM: Current Trades + Trade History (stacked)
+        # RIGHT BOTTOM: Current Trades + Trade History (tabs)
         # ----------------------------
-        right_bottom_split = ttk.Panedwindow(right_split, orient="vertical")
-        self._pw_right_bottom_split = right_bottom_split
+        right_bottom_frame = ttk.LabelFrame(right_split, text="Trades")
+        self._pw_right_bottom_split = None
 
-        right_bottom_split.bind("<Configure>", lambda e: self._schedule_paned_clamp(self._pw_right_bottom_split))
-        right_bottom_split.bind("<ButtonRelease-1>", lambda e: (
-            setattr(self, "_user_moved_right_bottom_split", True),
-            self._schedule_paned_clamp(self._pw_right_bottom_split),
-        ))
+        right_bottom_tabs = ttk.Notebook(right_bottom_frame)
+        right_bottom_tabs.pack(fill="both", expand=True, padx=6, pady=6)
 
-        # Current trades (top)
-        trades_frame = ttk.LabelFrame(right_bottom_split, text="Current Trades")
+        trades_frame = ttk.Frame(right_bottom_tabs)
+        hist_frame = ttk.Frame(right_bottom_tabs)
+        right_bottom_tabs.add(trades_frame, text="Current Trades")
+        right_bottom_tabs.add(hist_frame, text="Trade History")
+        try:
+            right_bottom_tabs.select(trades_frame)
+        except Exception:
+            pass
 
         cols = (
             "coin",
@@ -2843,6 +2846,9 @@ class PowerTraderHub(tk.Tk):
 
         trades_table_wrap = ttk.Frame(trades_frame)
         trades_table_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.lbl_trades_summary = ttk.Label(trades_table_wrap, text="Open positions: 0 | Trailing active: 0 | Exit hold: 0")
+        self.lbl_trades_summary.pack(anchor="w", pady=(0, 6))
 
         self.trades_tree = ttk.Treeview(
             trades_table_wrap,
@@ -2909,12 +2915,16 @@ class PowerTraderHub(tk.Tk):
                 w = int(base.get(c, 110) * scale)
                 self.trades_tree.column(c, width=max(60, min(420, w)))
 
+        try:
+            self.trades_tree.tag_configure("row_exit_hold", foreground=DARK_ACCENT2)
+            self.trades_tree.tag_configure("row_trailing", foreground=DARK_ACCENT)
+            self.trades_tree.tag_configure("row_profit_pos", foreground="#8CFFB5")
+            self.trades_tree.tag_configure("row_profit_neg", foreground="#FF9B9B")
+        except Exception:
+            pass
+
         self.trades_tree.bind("<Configure>", lambda e: self.after_idle(_resize_trades_columns))
         self.after_idle(_resize_trades_columns)
-
-
-        # Trade history (bottom)
-        hist_frame = ttk.LabelFrame(right_bottom_split, text="Trade History (scroll)")
 
         hist_wrap = ttk.Frame(hist_frame)
         hist_wrap.pack(fill="both", expand=True, padx=6, pady=6)
@@ -2938,24 +2948,14 @@ class PowerTraderHub(tk.Tk):
         ysb2.pack(side="right", fill="y")
         xsb2.pack(side="bottom", fill="x")
 
-
         # Assemble right side
         right_split.add(charts_frame, weight=3)
-        right_split.add(right_bottom_split, weight=2)
-
-        right_bottom_split.add(trades_frame, weight=2)
-        right_bottom_split.add(hist_frame, weight=1)
+        right_split.add(right_bottom_frame, weight=2)
 
         try:
             # Screenshot-style sizing: don't force Charts to be enormous by default.
             right_split.paneconfigure(charts_frame, minsize=360)
-            right_split.paneconfigure(right_bottom_split, minsize=220)
-        except Exception:
-            pass
-
-        try:
-            right_bottom_split.paneconfigure(trades_frame, minsize=140)
-            right_bottom_split.paneconfigure(hist_frame, minsize=120)
+            right_split.paneconfigure(right_bottom_frame, minsize=220)
         except Exception:
             pass
 
@@ -2984,32 +2984,7 @@ class PowerTraderHub(tk.Tk):
             except Exception:
                 pass
 
-        def _init_right_bottom_split_sash_once():
-            try:
-                if getattr(self, "_did_init_right_bottom_split_sash", False):
-                    return
-
-                if getattr(self, "_user_moved_right_bottom_split", False):
-                    self._did_init_right_bottom_split_sash = True
-                    return
-
-                total = right_bottom_split.winfo_height()
-                if total <= 2:
-                    self.after(10, _init_right_bottom_split_sash_once)
-                    return
-
-                min_top = 140
-                min_bottom = 120
-                desired_top = 280  # more space for Current Trades (like screenshot)
-                target = max(min_top, min(total - min_bottom, desired_top))
-
-                right_bottom_split.sashpos(0, int(target))
-                self._did_init_right_bottom_split_sash = True
-            except Exception:
-                pass
-
         self.after_idle(_init_right_split_sash_once)
-        self.after_idle(_init_right_bottom_split_sash_once)
 
         # Initial clamp once everything is laid out
         self.after_idle(lambda: (
@@ -3018,7 +2993,6 @@ class PowerTraderHub(tk.Tk):
             self._schedule_paned_clamp(getattr(self, "_pw_right_split", None)),
             self._schedule_paned_clamp(getattr(self, "_pw_right_bottom_split", None)),
         ))
-
 
         # status bar
         self.status = ttk.Label(self, text="Ready", anchor="w")
@@ -3995,6 +3969,10 @@ class PowerTraderHub(tk.Tk):
         for iid in self.trades_tree.get_children():
             self.trades_tree.delete(iid)
 
+        open_count = 0
+        trailing_active_count = 0
+        exit_hold_count = 0
+
         for sym, pos in positions.items():
             coin = sym
             qty = pos.get("quantity", 0.0)
@@ -4005,6 +3983,8 @@ class PowerTraderHub(tk.Tk):
                     continue
             except Exception:
                 continue
+
+            open_count += 1
 
             value = pos.get("value_usd", 0.0)
             avg_cost = pos.get("avg_cost_basis", 0.0)
@@ -4045,7 +4025,12 @@ class PowerTraderHub(tk.Tk):
             next_dca = pos.get("next_dca_display", "")
 
             trail_line = pos.get("trail_line", 0.0)
+            trail_active = bool(pos.get("trail_active", False))
+            if trail_active:
+                trailing_active_count += 1
             exit_hold_active = bool(pos.get("exit_hold_active", False))
+            if exit_hold_active:
+                exit_hold_count += 1
             exit_hold_age_sec = float(pos.get("exit_hold_age_sec", 0.0) or 0.0)
             exit_hold_reason = str(pos.get("exit_hold_reason", "") or "").strip()
             if exit_hold_active:
@@ -4055,6 +4040,20 @@ class PowerTraderHub(tk.Tk):
                     exit_hold_display = f"{exit_hold_display} {exit_hold_reason}"
             else:
                 exit_hold_display = ""
+
+            row_tag = ""
+            try:
+                sell_pnl_f = float(sell_pnl or 0.0)
+            except Exception:
+                sell_pnl_f = 0.0
+            if exit_hold_active:
+                row_tag = "row_exit_hold"
+            elif trail_active:
+                row_tag = "row_trailing"
+            elif sell_pnl_f > 0.0:
+                row_tag = "row_profit_pos"
+            elif sell_pnl_f < 0.0:
+                row_tag = "row_profit_neg"
 
             self.trades_tree.insert(
                 "",
@@ -4074,33 +4073,89 @@ class PowerTraderHub(tk.Tk):
                     _fmt_price(trail_line),  # trail line is a price level
                     exit_hold_display,
                 ),
+                tags=((row_tag,) if row_tag else ()),
             )
 
-
-
-
-
-
-
+        try:
+            self.lbl_trades_summary.config(
+                text=f"Open positions: {open_count} | Trailing active: {trailing_active_count} | Exit hold: {exit_hold_count}"
+            )
+        except Exception:
+            pass
 
 
     def _refresh_pnl(self) -> None:
-        # mtime cache: avoid reading/parsing every tick
+        # Display realized profit from the same visible era as the account chart.
         try:
-            mtime = os.path.getmtime(self.pnl_ledger_path)
+            m_pnl = os.path.getmtime(self.pnl_ledger_path)
         except Exception:
-            mtime = None
+            m_pnl = None
+        try:
+            m_trades = os.path.getmtime(self.trade_history_path)
+        except Exception:
+            m_trades = None
+        try:
+            m_acct = os.path.getmtime(self.account_value_history_path)
+        except Exception:
+            m_acct = None
 
-        if getattr(self, "_last_pnl_mtime", object()) == mtime:
+        sig = (m_pnl, m_trades, m_acct)
+        if getattr(self, "_last_pnl_sig", object()) == sig:
             return
-        self._last_pnl_mtime = mtime
+        self._last_pnl_sig = sig
 
-        data = _safe_read_json(self.pnl_ledger_path)
-        if not data:
-            self.lbl_pnl.config(text="Total realized: N/A")
+        start_ts = None
+        try:
+            if os.path.isfile(self.account_value_history_path):
+                with open(self.account_value_history_path, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = (ln or "").strip()
+                        if not ln:
+                            continue
+                        try:
+                            obj = json.loads(ln)
+                            ts = float(obj.get("ts", 0.0) or 0.0)
+                        except Exception:
+                            continue
+                        if ts > 0.0:
+                            start_ts = ts
+                            break
+        except Exception:
+            start_ts = None
+
+        if start_ts is None:
+            data = _safe_read_json(self.pnl_ledger_path)
+            if not data:
+                self.lbl_pnl.config(text="Realized since history start: N/A")
+                return
+            total = float(data.get("total_realized_profit_usd", 0.0) or 0.0)
+            self.lbl_pnl.config(text=f"Total realized: {_fmt_money(total)}")
             return
-        total = float(data.get("total_realized_profit_usd", 0.0))
-        self.lbl_pnl.config(text=f"Total realized: {_fmt_money(total)}")
+
+        total = 0.0
+        try:
+            if os.path.isfile(self.trade_history_path):
+                with open(self.trade_history_path, "r", encoding="utf-8") as f:
+                    for ln in f:
+                        ln = (ln or "").strip()
+                        if not ln:
+                            continue
+                        try:
+                            obj = json.loads(ln)
+                            ts = float(obj.get("ts", 0.0) or 0.0)
+                            realized = obj.get("realized_profit_usd", None)
+                            if realized is None:
+                                continue
+                            rv = float(realized)
+                        except Exception:
+                            continue
+                        if ts >= float(start_ts):
+                            total += rv
+        except Exception:
+            pass
+
+        since_txt = time.strftime("%Y-%m-%d", time.localtime(float(start_ts)))
+        self.lbl_pnl.config(text=f"Realized (since {since_txt}): {_fmt_money(total)}")
 
 
     def _refresh_trade_history(self) -> None:
@@ -4152,7 +4207,8 @@ class PowerTraderHub(tk.Tk):
                 if tag:
                     action = f"{side}/{tag}"
 
-                txt = f"{tss} | {action:10s} {sym:5s} | qty={qty} | px={px_txt}"
+                coin_tag = str(sym).split("-")[0].strip().upper() if sym else "?"
+                txt = f"{tss} | {coin_tag} | {action} | qty={qty} | px={px_txt}"
 
                 # Show the exact trade-time PnL%:
                 # - DCA buys: show the BUY-side PnL (how far below avg cost it was when it bought)
@@ -4179,6 +4235,16 @@ class PowerTraderHub(tk.Tk):
                     txt += " | exit-hold"
 
                 self.hist_list.insert("end", txt)
+                try:
+                    idx = self.hist_list.size() - 1
+                    if side == "SELL":
+                        self.hist_list.itemconfig(idx, foreground=DARK_ACCENT)
+                    elif side == "BUY" and tag == "DCA":
+                        self.hist_list.itemconfig(idx, foreground=DARK_ACCENT2)
+                    elif side == "BUY":
+                        self.hist_list.itemconfig(idx, foreground="#FF9B9B")
+                except Exception:
+                    pass
             except Exception:
                 self.hist_list.insert("end", line)
 
@@ -4759,15 +4825,23 @@ class PowerTraderHub(tk.Tk):
 
             open_trades = []
             try:
+                tracked = {
+                    str(c).upper().strip()
+                    for c in (self.settings.get("coins", []) or [])
+                    if str(c).strip()
+                }
                 positions = getattr(self, "_last_positions", {}) or {}
                 if isinstance(positions, dict):
                     for coin, pos in positions.items():
+                        coin_u = str(coin).upper().strip()
+                        if tracked and coin_u not in tracked:
+                            continue
                         try:
                             qty = float((pos or {}).get("quantity", 0.0) or 0.0)
                         except Exception:
                             qty = 0.0
                         if qty > 0.0:
-                            open_trades.append(str(coin).upper().strip())
+                            open_trades.append(coin_u)
             except Exception:
                 pass
 

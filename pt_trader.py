@@ -451,15 +451,15 @@ class CryptoAPITrading:
         self.exit_hold_intents: Dict[str, dict] = {}
         self.exit_hold_used_flags: Dict[str, bool] = {}
 
-        self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis at startup
-        self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
-
         # GUI/runtime persistence used for restart recovery and Hub display.
         self._pnl_ledger = self._load_pnl_ledger()
         if auto_reconcile:
             # First reconcile normal pending orders, then try delayed recovery for stale ones.
             self._reconcile_pending_orders()
             self._reconcile_stale_pending_orders(dry_run=False)
+
+        self.cost_basis = self.calculate_cost_basis()  # Initialize cost basis after ledger reconcile
+        self.initialize_dca_levels()  # Initialize DCA levels based on historical buy orders
 
 
         # Cache last known bid/ask per symbol so transient API misses don't zero out account value
@@ -1298,16 +1298,25 @@ class CryptoAPITrading:
 
     def _format_open_trades_for_notification(self) -> str:
         try:
+            settings = _load_gui_settings()
+            tracked = {
+                str(c).upper().strip()
+                for c in (settings.get("coins", []) or [])
+                if str(c).strip()
+            }
             open_pos = self._pnl_ledger.get("open_positions", {})
             if not isinstance(open_pos, dict):
                 return "None"
             coins = []
             for coin, pos in open_pos.items():
+                coin_u = str(coin).upper().strip()
+                if tracked and coin_u not in tracked:
+                    continue
                 if not isinstance(pos, dict):
                     continue
                 qty = float(pos.get("qty", 0.0) or 0.0)
                 if qty > 1e-12:
-                    coins.append(str(coin).upper().strip())
+                    coins.append(coin_u)
             coins = sorted(set(c for c in coins if c))
             if not coins:
                 return "None"
@@ -1324,6 +1333,7 @@ class CryptoAPITrading:
         qty: float,
         price: Optional[float],
         tag: Optional[str] = None,
+        pnl_pct: Optional[float] = None,
         realized: Optional[float] = None,
         buying_power_after: Optional[float] = None,
     ) -> None:
@@ -1364,11 +1374,24 @@ class CryptoAPITrading:
             except Exception:
                 lines.append(f"price: {price}")
 
+        try:
+            position_value = float(qty or 0.0) * float(price) if price is not None else None
+            if position_value is not None and position_value > 0.0:
+                lines.append(f"position value: {position_value:.2f} USDT")
+        except Exception:
+            pass
+
         if realized is not None and side_l == "sell":
             try:
                 lines.append(f"realized pnl: {float(realized):+.2f} USD")
             except Exception:
                 lines.append(f"realized pnl: {realized}")
+
+        if pnl_pct is not None and side_l == "sell":
+            try:
+                lines.append(f"pnl: {float(pnl_pct):+.2f}%")
+            except Exception:
+                lines.append(f"pnl: {pnl_pct}")
 
         if buying_power_value is not None:
             try:
@@ -1567,6 +1590,7 @@ class CryptoAPITrading:
             qty=qty,
             price=price,
             tag=tag,
+            pnl_pct=pnl_pct,
             realized=realized,
             buying_power_after=buying_power_after,
         )
@@ -2229,6 +2253,25 @@ class CryptoAPITrading:
         cost_basis = {}
 
         for asset_code in active_assets:
+            # Ledger is the most reliable source for the bot's live tradable position cost.
+            # This avoids false profit when KuCoin order history omits an older BUY/DCA row.
+            try:
+                open_pos = self._pnl_ledger.get("open_positions", {}) or {}
+                pos = open_pos.get(asset_code)
+                if isinstance(pos, dict):
+                    ledger_qty = float(pos.get("qty", 0.0) or 0.0)
+                    ledger_cost = float(pos.get("usd_cost", 0.0) or 0.0)
+                    if ledger_qty > 1e-12 and ledger_cost > 0.0:
+                        cost_basis[asset_code] = ledger_cost / ledger_qty
+                        print(
+                            f"[TRADER] Using ledger cost basis for {asset_code}: "
+                            f"${cost_basis[asset_code]:.8f} "
+                            f"(usd_cost: ${ledger_cost:.8f}, qty: {ledger_qty:.8f})"
+                        )
+                        continue
+            except Exception as e:
+                print(f"[TRADER] Ledger cost basis lookup failed for {asset_code}: {e}")
+
             orders = self.get_orders(f"{asset_code}-USD")
             if not orders or "results" not in orders:
                 print(f"[TRADER] No orders found for {asset_code}, trying trade history...")
