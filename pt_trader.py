@@ -421,6 +421,7 @@ class CryptoAPITrading:
         # Lightweight soft-error tracking (for previously silent except blocks)
         self._soft_error_buckets: Dict[str, list] = {}
         self._soft_error_last_alert_ts = 0.0
+        self._critical_alert_last_sent: Dict[str, float] = {}
 
         self.dca_levels_triggered = {}  # Track DCA levels for each crypto
         self.dca_levels = list(DCA_LEVELS)  # Hard DCA triggers (percent PnL)
@@ -578,6 +579,151 @@ class CryptoAPITrading:
                         "window_sec": int(SOFT_ERROR_WINDOW_SEC),
                     },
                 )
+
+    def _send_critical_telegram_alert(
+        self,
+        title: str,
+        body_lines: list,
+        dedupe_key: str,
+        min_interval_sec: float = 300.0,
+    ) -> None:
+        try:
+            now = time.time()
+            prev = float(self._critical_alert_last_sent.get(dedupe_key, 0.0) or 0.0)
+            if (now - prev) < float(min_interval_sec):
+                return
+
+            settings = _load_gui_settings()
+            if not bool(settings.get("telegram_enabled", False)):
+                return
+
+            bot_token = str(settings.get("telegram_bot_token", "") or "").strip()
+            chat_id = str(settings.get("telegram_chat_id", "") or "").strip()
+            if not bot_token or not chat_id:
+                return
+
+            lines = [str(title).strip()]
+            for line in body_lines or []:
+                txt = str(line or "").strip()
+                if txt:
+                    lines.append(txt)
+
+            if not send_telegram_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                text="\n".join(lines),
+                timeout=4.0,
+            ):
+                return
+
+            self._critical_alert_last_sent[dedupe_key] = now
+        except Exception:
+            pass
+
+    def _warn_state_drift(
+        self,
+        where: str,
+        message: str,
+        critical: bool = False,
+        dedupe_key: Optional[str] = None,
+        telegram_lines: Optional[list] = None,
+        **ctx: Any,
+    ) -> None:
+        try:
+            self._log_soft_error(where, RuntimeError(str(message or "").strip()), **ctx)
+        except Exception:
+            pass
+
+        if critical:
+            key = str(dedupe_key or where).strip() or where
+            try:
+                lines = list(telegram_lines or [])
+            except Exception:
+                lines = []
+            self._send_critical_telegram_alert(
+                title="[TRADER ALERT] State Drift",
+                body_lines=[str(message or "").strip()] + lines,
+                dedupe_key=key,
+            )
+
+    def _get_material_ledger_position(
+        self,
+        base_symbol: str,
+        current_sell_price: Optional[float] = None,
+    ) -> Optional[dict]:
+        try:
+            base = str(base_symbol or "").upper().strip()
+            if not base:
+                return None
+
+            open_pos = self._pnl_ledger.get("open_positions", {}) or {}
+            pos = open_pos.get(base)
+            if not isinstance(pos, dict):
+                return None
+
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            usd_cost = float(pos.get("usd_cost", 0.0) or 0.0)
+            if qty <= 1e-12 or usd_cost <= 1e-9:
+                return None
+
+            sell_px = 0.0
+            try:
+                sell_px = float(current_sell_price or 0.0)
+            except Exception:
+                sell_px = 0.0
+
+            est_value = qty * sell_px if sell_px > 0.0 else 0.0
+            material_value = max(float(est_value), float(usd_cost))
+            if material_value < float(DUST_VALUE_USD):
+                return None
+
+            avg_cost = (usd_cost / qty) if qty > 0.0 else 0.0
+            return {
+                "base": base,
+                "qty": float(qty),
+                "usd_cost": float(usd_cost),
+                "estimated_value_usd": float(est_value),
+                "material_value_usd": float(material_value),
+                "avg_cost_basis": float(avg_cost),
+            }
+        except Exception:
+            return None
+
+    def _find_missing_material_ledger_bases(
+        self,
+        holdings_list: list,
+        current_sell_prices: Dict[str, float],
+    ) -> list:
+        try:
+            visible = set()
+            for holding in holdings_list or []:
+                if not isinstance(holding, dict):
+                    continue
+                base = str(holding.get("asset_code", "")).upper().strip()
+                if not base:
+                    continue
+                try:
+                    qty = float(holding.get("total_quantity", 0.0) or 0.0)
+                except Exception:
+                    qty = 0.0
+                if qty > 0.0:
+                    visible.add(base)
+
+            missing = []
+            open_pos = self._pnl_ledger.get("open_positions", {}) or {}
+            for base in open_pos.keys():
+                full_symbol = f"{str(base).upper().strip()}-USD"
+                ledger_pos = self._get_material_ledger_position(
+                    str(base).upper().strip(),
+                    current_sell_price=current_sell_prices.get(full_symbol, 0.0),
+                )
+                if ledger_pos and str(base).upper().strip() not in visible:
+                    missing.append(str(base).upper().strip())
+
+            missing.sort()
+            return missing
+        except Exception:
+            return []
 
     def _append_jsonl(self, path: str, obj: dict) -> None:
         try:
@@ -3087,6 +3233,22 @@ class CryptoAPITrading:
             holdings_list = []
             snapshot_ok = False
 
+        missing_ledger_bases = self._find_missing_material_ledger_bases(holdings_list, current_sell_prices)
+        if missing_ledger_bases:
+            snapshot_ok = False
+            self._warn_state_drift(
+                "manage_trades.holdings_ledger_mismatch",
+                "Live holdings payload is missing coin(s) that still exist in the local open-position ledger.",
+                critical=True,
+                dedupe_key="holdings_ledger_mismatch",
+                telegram_lines=[
+                    f"missing in holdings: {', '.join(missing_ledger_bases)}",
+                    "Snapshot kept at last good value to avoid false account-value drops.",
+                ],
+                missing_bases=",".join(missing_ledger_bases),
+                holdings_count=len(holdings_list or []),
+            )
+
         holdings_buy_value = 0.0
         holdings_sell_value = 0.0
 
@@ -3839,6 +4001,32 @@ class CryptoAPITrading:
         while start_index < len(crypto_symbols):
             base_symbol = crypto_symbols[start_index].upper().strip()
             full_symbol = f"{base_symbol}-USD"
+
+            ledger_pos = self._get_material_ledger_position(
+                base_symbol,
+                current_sell_price=current_sell_prices.get(full_symbol, 0.0),
+            )
+            if ledger_pos:
+                if full_symbol not in holding_full_symbols:
+                    self._warn_state_drift(
+                        "manage_trades.block_fresh_buy_existing_ledger_position",
+                        f"Blocked fresh BUY for {base_symbol} because the local ledger still shows an open position.",
+                        critical=True,
+                        dedupe_key=f"block_fresh_buy:{base_symbol}",
+                        telegram_lines=[
+                            f"coin: {base_symbol}",
+                            f"ledger qty: {ledger_pos['qty']:.8f}".rstrip("0").rstrip("."),
+                            f"ledger avg cost: {ledger_pos['avg_cost_basis']:.2f} USDT",
+                            f"estimated position value: {ledger_pos['material_value_usd']:.2f} USDT",
+                        ],
+                        symbol=base_symbol,
+                        ledger_qty=ledger_pos["qty"],
+                        ledger_usd_cost=ledger_pos["usd_cost"],
+                        ledger_avg_cost=ledger_pos["avg_cost_basis"],
+                        holding_visible=False,
+                    )
+                start_index += 1
+                continue
 
             # Skip if already held
             if full_symbol in holding_full_symbols:

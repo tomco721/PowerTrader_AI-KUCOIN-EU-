@@ -29,6 +29,9 @@ Main fork differences:
 - Trade history and realized/open-position accounting are written locally for GUI display and restart recovery.
 - The trader now prefers order-derived fill notional/fees from KuCoin order detail (`dealFunds` / `dealSize`) for local accounting, with buying-power deltas kept only as a fallback/debug path.
 - Live cost basis for active positions now prefers the local ledger's exact open-position cost (`pnl_ledger.json` `usd_cost / qty`) before falling back to exchange order history, so a missing older BUY in KuCoin history cannot fabricate a false profitable SELL.
+- Fresh BUY entry now also checks the local open-position ledger before starting a new trade, so a transient holdings/API miss cannot accidentally reopen a coin that the bot already holds.
+- Account-value snapshots now keep the previous good value when live holdings temporarily disagree with the local open-position ledger, preventing false low account values in the Hub/Telegram during exchange data glitches.
+- Critical state-drift warnings are appended to `hub_data/trader_errors.jsonl`, and important drift events can raise rate-limited Telegram alerts without interrupting trading.
 - `pnl_ledger.json` recovery is hardened: startup can recover from the main file, `.bak`, or `.tmp` if the primary JSON is damaged.
 - Telegram trade notifications can be configured from the Hub for confirmed BUY, DCA BUY, and SELL events.
 - Dust positions are ignored for fresh-entry blocking and for most DCA/trailing decisions.

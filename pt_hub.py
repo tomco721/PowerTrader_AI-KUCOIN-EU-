@@ -1593,6 +1593,7 @@ class PowerTraderHub(tk.Tk):
 
         # Internal Start All flow: start runner first, then auto-start trader only after runner readiness is confirmed.
         self._auto_start_trader_pending = False
+        self._resume_neural_after_training = False
 
         # Minimal file-heartbeat watchdog.
         # It only acts on processes that are already running and watches hub_data timestamps for staleness.
@@ -3428,6 +3429,10 @@ class PowerTraderHub(tk.Tk):
         if not coin:
             return
 
+        neural_running = bool(self.proc_neural.proc and self.proc_neural.proc.poll() is None)
+        if neural_running:
+            self._resume_neural_after_training = True
+
         # Stop the Neural Runner before any training starts (training modifies artifacts the runner reads)
         self.stop_neural()
 
@@ -3540,6 +3545,7 @@ class PowerTraderHub(tk.Tk):
     def stop_all_scripts(self) -> None:
         # Cancel any pending "wait for runner then start trader"
         self._auto_start_trader_pending = False
+        self._resume_neural_after_training = False
 
         self.stop_neural()
         self.stop_trader()
@@ -3682,6 +3688,15 @@ class PowerTraderHub(tk.Tk):
                 self.lbl_flow_hint.config(text="Flow: Running (use the button to stop)")
             else:
                 self.lbl_flow_hint.config(text="Flow: Start All")
+        except Exception:
+            pass
+
+        # If training temporarily stopped a previously running neural process,
+        # restore it after the last trainer exits.
+        try:
+            if self._resume_neural_after_training and (not training_running) and (not neural_running):
+                self._resume_neural_after_training = False
+                self.start_neural()
         except Exception:
             pass
 
